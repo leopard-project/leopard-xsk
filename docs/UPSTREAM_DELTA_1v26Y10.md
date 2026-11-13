@@ -196,3 +196,38 @@ Leopard 目前全部静态 ELF，暂不需要；若将来要用 XACT 的动态 S
 | `driver/fs/vfs/vfs.cpp` | `permissions_file_access` 全面替换 `ime_vfs_access` | 本地 `vfs_access_allowed` + 钩子 | 设计对齐后再改 |
 | `kernel/user/user.cpp` | 凭证/认证重构 | 本地 root/oobe 简化模型 | 随 P0/P3 一起改 |
 | `include/syscall/pxapi.h` | 7496-7502 等 | 本地只有到 7486 | 按 P0 增补 |
+
+---
+
+# 第三部分：`da07c5f` → `93d76a7`（2026-11-13）
+
+> 范围：7 个非 merge 提交，主题几乎全是安装器原生化（FAT32/ext4 双路径）。
+> 结论：只移植 3 处内核原语修复，其余归安装器/构建工具。
+
+## 8. 分类
+
+| 提交 | 主题 | 归属 | 处理 |
+|---|---|---|---|
+| `716b054` | 读取可执行镜像时保留 VFS 错误 | **内核原语** | ✅ 已移植（配合 `permissions_file_error()`） |
+| `370dea6` | pipefs 挂载根保持目录语义 | **内核原语** | ✅ 已移植（本树无 `vfs_close_cached_backend`，改为直接复位类型/大小） |
+| `214d373`（部分） | `kernel/cpu/common.cpp` 给 `insw` 加 `"memory"` clobber | **内核原语** | ✅ 已移植（仅上游改的 `insw`；`outsw` 同类问题未动，遵守“不改上游 bug”） |
+| `76f1c06` | 安装器支持 VMware 介质与大 ext4 包 | 安装器业务 + IDE/AHCI/block 驱动 | ❌ 暂缓（QEMU/AHCI 路径不需要） |
+| `214d373` / `695bdee` | FAT32/ext4 有界安装、原生命令限制为 ext4 | 安装器业务 | ❌ 不移植 |
+| `214d373` | `driver/fs/fatfs`、`driver/fs/ext4`、`driver/{ahci,ide}/` | 绑定根校验/安装 I/O | ❌ 暂缓（属原生安装路径） |
+| `b5bf6f6` | 默认镜像打包改为 ext4 + FAT32 ESP | 构建工具 | ❌ 不移植（Leopard 仍 FAT32 + xbps） |
+| `15860ea` | 修复 CI 写死偏移 | CI 工具 | ❌ 不移植 |
+
+## 9. 本次移植的细节
+
+1. **VFS 错误透传**（`716b054`）
+   - `tcb` 增加 `file_access_error`；
+   - `permissions_file_access()` 入口清零、拒绝时置 `EACCES`；
+   - `read_vfs_file()` 读不完整时返回 `-permissions_file_error()`（否则 `-EIO`），并打印 inode/size/fsid 诊断。
+
+2. **pipefs 挂载根目录语义**（`370dea6`）
+   - `pipefs_open()`：根节点为 `file_dir`，子节点才是 `file_pipe`；
+   - `pipefs_mount()`：复位 `type=file_dir`、`size=0`；
+   - `pipefs_stat()`：补 NULL 守卫并特判根节点。
+
+3. **`insw` 编译器屏障**（`214d373`）
+   - `asm volatile("cld; rep; insw" ... : "memory")`，防止编译器把内存访问重排到端口 I/O 两侧。
