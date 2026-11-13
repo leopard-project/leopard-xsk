@@ -1024,7 +1024,13 @@ int create_user_process_from_file_as(char *path, pcb_t pcb, char *argv[], int cr
         return -ENOMEM;
     }
     group->argc = argc;
-    char *cwd = getCwd(path);
+    /* XAPI_RunArgs 启动的应用应继承调用者 cwd（shell 的 cd 才有意义）；
+       内核/PID1 拉起（pcb == NULL）仍按可执行文件目录。 */
+    char *cwd = NULL;
+    tcb_t caller = get_current_task();
+    if (pcb != NULL && caller != NULL && caller->cwd != NULL)
+        cwd = vfs_get_fullpath(caller->cwd);
+    if (cwd == NULL) cwd = getCwd(path);
     if (cwd == NULL)
     {
         free_process_argv(thread_argv);
