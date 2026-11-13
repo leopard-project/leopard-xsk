@@ -225,6 +225,8 @@ typedef bool (*vfs_access_hook_t)(vfs_node_t node, const char *path, vfs_access_
 typedef void (*vfs_resolved_name_hook_t)(vfs_node_t node, const char *name);
 
 void vfs_set_access_hook(vfs_access_hook_t fn);
+// 追加策略钩子（权限层/模块可共存；返回 false = 钩子表已满）
+bool vfs_add_access_hook(vfs_access_hook_t fn);
 void vfs_set_resolved_name_hook(vfs_resolved_name_hook_t fn);
 // 内核内部：访问策略判定（无钩子时默认放行）
 bool vfs_access_allowed(vfs_node_t node, const char *path, vfs_access_op_t op);

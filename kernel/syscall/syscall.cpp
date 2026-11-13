@@ -16,6 +16,8 @@
 #include <screen_capture.h>
 #include <syscall/signal.h>
 #include <syscall/xapi_user.h>
+#include <user/file_access.h>
+#include <user/permissions.h>
 #include <syscall/pxapi.h>
 #include <syscall/syscall.h>
 #include <task/poll.h>
@@ -679,23 +681,42 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case XAPI_SET_SECRET:
         regs->rax = (uint64_t)screen_capture_set_secret();
         break;
-    // Interim permission primitives: no model yet, so everything is permitted.
     case XAPI_LIFT_PERMISSIONS:
+        regs->rax = (uint64_t)(int64_t)(regs->rdi > XUT_Custom ?
+            -EINVAL : permissions_lift((UserType)regs->rdi));
+        break;
     case XAPI_REQUEST_PERMISSIONS:
-    case XAPI_QUERY_FILE_ACCESS:
-    case XAPI_REQUEST_FILE_ACCESS:
-    case XAPI_REQUEST_SPECIAL_PERMISSION:
-        regs->rax = 0;
+        regs->rax = (uint64_t)(int64_t)(regs->rdi > XPERM_ALL ?
+            -EINVAL : permissions_request((uint8_t)regs->rdi));
         break;
     case XAPI_GET_CURRENT_PERMISSIONS:
     {
-        XapiPermissionSnapshot snapshot = {true, true, true, true, true, true, true};
+        UserPermisson value = user_permissions_from_mask(permissions_current_mask());
         page_directory_t *pagedir = xapi_current_pagedir();
         regs->rax = pagedir &&
-            copy_to_user_pagedir(pagedir, (void *)regs->rdi, &snapshot, sizeof(snapshot)) ?
+            copy_to_user_pagedir(pagedir, (void *)regs->rdi, &value, sizeof(value)) ?
                 0 : (uint64_t)-EFAULT;
         break;
     }
+    case XAPI_QUERY_FILE_ACCESS:
+    case XAPI_REQUEST_FILE_ACCESS:
+    {
+        char *path = NULL;
+        int result = xapi_copy_string_from_user(&path, (const char *)regs->rdi, XAPI_USER_PATH_MAX);
+        if (result == 0)
+        {
+            result = regs->rax == XAPI_QUERY_FILE_ACCESS ?
+                permissions_query_file(path, regs->rsi) :
+                permissions_request_file(path, regs->rsi);
+            free(path);
+        }
+        regs->rax = (uint64_t)(int64_t)result;
+        break;
+    }
+    case XAPI_REQUEST_SPECIAL_PERMISSION:
+        // No special-permission store in this tree yet; ordinary masks apply.
+        regs->rax = 0;
+        break;
     case XAPI_SPAWN_INHERITED:
         // Needs a kernel-side fork+exec with inherited identity; not wired yet.
         // Existing components use XAPI_FORK/XAPI_EXECVE directly.

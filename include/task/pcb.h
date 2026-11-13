@@ -139,6 +139,9 @@ struct process_control_block
     uint64_t notify_pcor_func;
     bool     notify_pcor_registered;
 
+    UserInfo   permission_user;     // Process-owned identity; never aliases the login account.
+    uint64_t   permission_revision; // Invalidates queued consent across exec.
+
     bool       screen_secret;      // Process-lifetime global capture prohibition.
     bool       screen_raw_mapped;  // Live framebuffer mappings cannot be revoked by a syscall check.
     pcb_t      screen_capture_next; // Intrusive policy list, protected by the capture state lock.
@@ -233,6 +236,10 @@ uint64_t task_user_fs_selector(tcb_t task);
 size_t   create_kernel_thread(void *_start, void *args, char *name, pcb_t pcb);
 size_t   create_user_thread(void *_start, void *args, int argc, char *name, pcb_t pcb, char *cwd);
 pcb_t    create_process_group(const char *name, pcb_t parent, page_directory_t *directory, char *cmdline);
+// credential_source: ProcessCredentialSource (0 login, 1 inherit, 2 visitor).
+pcb_t    create_process_group_as(const char *name, pcb_t parent, page_directory_t *directory,
+                                 char *cmdline, int credential_source);
+int      create_user_process_from_file_as(char *path, pcb_t pcb, char *argv[], int credential_source);
 uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, uint64_t clone_flags = 0,
                       int *parent_tid = NULL, int *child_tid = NULL);
 uint64_t thread_clone(struct X64_REGS *reg, uint64_t flags, uint64_t stack, int *parent_tid, int *child_tid,

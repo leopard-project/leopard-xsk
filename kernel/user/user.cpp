@@ -21,6 +21,7 @@
 #include <task/pcb.h>
 #include <task/scheduler.h>
 #include <user/user.h>
+#include <user/permissions.h>
 #include <user/runfile.h>
 #include <cpu/lock.h>
 #include <cpu/regio.h>
@@ -252,8 +253,12 @@ static void set_current_user_from_info(UserInfo *info)
     strcpy(current_user->name, info->name);
     strcpy(current_user->password, info->password);
     current_user->user_type = info->user_type;
+    current_user->user_prms = info->user_prms;
+    if (current_user->user_type != XUT_Custom && user_permission_mask(current_user->user_prms) == 0)
+        current_user->user_prms = user_permissions_from_mask(permissions_grade_mask(current_user->user_type));
     current_user->envc      = 3;
     current_user->envp      = current_user_envp;
+    permissions_session_publish(current_user);
 }
 
 bool user_session_is_ready()
@@ -899,7 +904,7 @@ static void free_process_argv(char **argv)
     free(argv);
 }
 
-int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
+int create_user_process_from_file_as(char *path, pcb_t pcb, char *argv[], int credential_source)
 {
     if (path == NULL)
     {
@@ -920,7 +925,8 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
         write_serial_fmt("Create User Process Failed. Reason: Cannot Clone Page Directory.\n");
         return -ENOMEM;
     }
-    pcb_t             group         = create_process_group(process_name, pcb, new_directory, (char *)"");
+    pcb_t             group         = create_process_group_as(process_name, pcb, new_directory, (char *)"",
+                                                               credential_source);
     if (group == NULL)
     {
         free_page_directory(new_directory);
@@ -1026,6 +1032,11 @@ int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
     }
 
     return group->pid;
+}
+
+int create_user_process_from_file(char *path, pcb_t pcb, char *argv[])
+{
+    return create_user_process_from_file_as(path, pcb, argv, (int)XPCS_LOGIN);
 }
 
 int create_user_process_singleton_from_file(char *path, pcb_t pcb, char *argv[])

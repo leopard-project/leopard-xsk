@@ -35,6 +35,7 @@
 #include <syscall/syscall.h>
 #include <task/pcb.h>
 #include <task/scheduler.h>
+#include <user/permissions.h>
 #include <user/runfile.h>
 #include <user/settings.h>
 #include <user/info_register.h>
@@ -505,6 +506,9 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     else
         mount_root();
     if (!installer_root_is_tmpfs_ready()) tmpfs_setup();
+    // Permission policy is boot-time config: the kernel owns the mechanism,
+    // permissions.conf owns grade masks and public/protected path sets.
+    permissions_init("/system/config/permissions.conf");
     pipefs_setup();
     pty_init();
     fsgsbase_init();

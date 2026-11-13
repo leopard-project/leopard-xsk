@@ -358,9 +358,7 @@ uint64_t do_xapi_InstallerLog(uint64_t out);
 // Process-lifetime global screen capture protection.
 #define XAPI_SET_SECRET           7486
 
-// Permission surface (XACT 2026v5). Interim allow-all primitives: the kernel
-// has no permission model yet, so these report full access. Replace with the
-// credential/enforcement model when the policy/mechanism split lands.
+// Permission surface (XACT 2026v5); implementation in user/permissions.h.
 #define XAPI_LIFT_PERMISSIONS           7496
 #define XAPI_GET_CURRENT_PERMISSIONS    7497
 #define XAPI_REQUEST_PERMISSIONS        7498
@@ -368,20 +366,6 @@ uint64_t do_xapi_InstallerLog(uint64_t out);
 #define XAPI_QUERY_FILE_ACCESS          7500
 #define XAPI_REQUEST_FILE_ACCESS        7501
 #define XAPI_REQUEST_SPECIAL_PERMISSION 7502
-
-// Wire format of UserPermisson in the XACT 2026v5 SDK (7 packed bools, no
-// padding). Kept separate from the internal UserPermisson so the on-disk user
-// registry layout is not disturbed before the permission model is migrated.
-typedef struct
-{
-    bool ReadFile;
-    bool WriteFile;
-    bool ChangeSettings;
-    bool VisitAnotherDir;
-    bool VisitSysDir;
-    bool ReadSysFile;
-    bool WriteSysFile;
-} XapiPermissionSnapshot;
 
 void init_syscall();
 

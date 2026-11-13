@@ -22,6 +22,7 @@
 #include <screen_capture.h>
 #include <syscall/syscall.h>
 #include <task/ipc.h>
+#include <user/permissions.h>
 
 #define SA_RPL3 3
 
@@ -484,6 +485,7 @@ extern void remove_task(tcb_t task);
 
 void kill_thread0(tcb_t task)
 {
+    permissions_thread_exit(task);
     task->status = OUT;
     clear_child_tid_if_requested(task);
     if (task->argv != NULL)
@@ -1644,6 +1646,7 @@ uint64_t process_execve(char *path, char **argv, char **envp)
      * naming the new image. Do not move ELF/VFS work or heap allocation under
      * create_thread_lock or this scheduler-disabled section.
      */
+    permissions_process_exec(process);
     bool was_vfork = process->vfork;
     lock_queue *old_virt_queue = process->virt_queue;
     vma_manager_t old_vma_manager = process->vma_manager;
@@ -1996,6 +1999,7 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     memset(new_pcb, 0, sizeof(struct process_control_block));
     new_pcb->queue_index = (size_t)-1;
     new_pcb->child_index = (size_t)-1;
+    permissions_process_init(new_pcb, current_pcb, XPCS_INHERIT);
     new_pcb->pid = alloc_pid();
     strcpy(new_pcb->name, current_pcb->name);
     write_serial_fmt("fork name: %s\n", new_pcb->name);
@@ -2126,7 +2130,7 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     new_task->cwd           = parent_task->cwd;
     if (new_task->cwd != NULL) new_task->cwd->refcount++;
     new_task->str_cwd       = parent_task->str_cwd != NULL ? strdup(parent_task->str_cwd) : NULL;
-    new_task->user_info     = parent_task->user_info;
+    new_task->user_info     = &new_pcb->permission_user;
     strcpy(new_task->name, parent_task->name);
     new_task->winnum  = 0;
     new_task->hasfscr = false;
@@ -2412,7 +2416,7 @@ size_t create_user_thread(void *_start, void *args, int argc, char *name, pcb_t 
     new_task->argv = (char **)args;
     new_task->argc = argc;
 
-    new_task->user_info = current_user != NULL ? current_user : &root_user;
+    new_task->user_info = &pcb->permission_user;
 
     write_serial_fmt("[task-debug] create_user_thread before-user-stack name=%s\n", name ? name : "(null)");
     new_task->user_stack     = page_reserve_user_range(pcb->pagedir, BIG_USER_STACK);
@@ -2555,7 +2559,7 @@ size_t create_message_thread(void *_start, char *name, pcb_t pcb, char *cwd, uin
     new_task->winnum  = 0;
     new_task->hasfscr = false;
 
-    new_task->user_info = current_user;
+    new_task->user_info = &pcb->permission_user;
 
     new_task->user_stack     = page_reserve_user_range(pcb->pagedir, BIG_USER_STACK);
     if (new_task->user_stack == 0)
@@ -2629,7 +2633,8 @@ size_t create_message_thread(void *_start, char *name, pcb_t pcb, char *cwd, uin
     return new_task->tid;
 }
 
-pcb_t create_process_group(const char *name, pcb_t parent, page_directory_t *directory, char *cmdline)
+pcb_t create_process_group_as(const char *name, pcb_t parent, page_directory_t *directory,
+                              char *cmdline, int credential_source)
 {
     pcb_t pcb        = (pcb_t)calloc(1, sizeof(struct process_control_block));
     if (pcb == NULL) return NULL;
@@ -2650,6 +2655,7 @@ pcb_t create_process_group(const char *name, pcb_t parent, page_directory_t *dir
     pcb->notify_pcor_tid           = 0;
     pcb->notify_pcor_func          = 0;
     pcb->notify_pcor_registered    = false;
+    permissions_process_init(pcb, parent_group, (ProcessCredentialSource)credential_source);
     pcb->queue_index = queue_enqueue(pcb_group_queue, pcb);
     if (pcb->queue_index == (size_t)-1)
     {
@@ -2765,6 +2771,11 @@ pcb_t create_process_group(const char *name, pcb_t parent, page_directory_t *dir
     memset(pcb->xtttp_stc, 0, sizeof(xtttp_dtt));
 
     return pcb;
+}
+
+pcb_t create_process_group(const char *name, pcb_t parent, page_directory_t *directory, char *cmdline)
+{
+    return create_process_group_as(name, parent, directory, cmdline, (int)XPCS_LOGIN);
 }
 
 extern "C" uint64_t switch_to_kernel_stack()

@@ -25,13 +25,29 @@
 
 vfs_node_t rootdir = NULL;
 
-// 通用 VFS 策略钩子（内核态模块注册，如 IME 文件保护）。NULL = 无策略，默认放行。
-static vfs_access_hook_t         g_vfs_access_hook = NULL;
+// 通用 VFS 策略钩子（内核权限层 + 内核态模块，如 IME 文件保护）。
+// 空链 = 无策略，默认放行；任一钩子拒绝即拒绝。
+static constexpr int VFS_ACCESS_HOOK_MAX = 4;
+static vfs_access_hook_t         g_vfs_access_hooks[VFS_ACCESS_HOOK_MAX];
+static int                       g_vfs_access_hook_count = 0;
 static vfs_resolved_name_hook_t  g_vfs_resolved_name_hook = NULL;
 
 void vfs_set_access_hook(vfs_access_hook_t fn)
 {
-    g_vfs_access_hook = fn;
+    // 兼容旧的单槽 API：替换第 0 槽，不动权限层/其他模块。
+    g_vfs_access_hooks[0] = fn;
+    if (fn != NULL && g_vfs_access_hook_count < 1) g_vfs_access_hook_count = 1;
+    if (fn == NULL && g_vfs_access_hook_count <= 1) g_vfs_access_hook_count = 0;
+}
+
+bool vfs_add_access_hook(vfs_access_hook_t fn)
+{
+    if (fn == NULL) return true;
+    for (int i = 0; i < g_vfs_access_hook_count; ++i)
+        if (g_vfs_access_hooks[i] == fn) return true;
+    if (g_vfs_access_hook_count >= VFS_ACCESS_HOOK_MAX) return false;
+    g_vfs_access_hooks[g_vfs_access_hook_count++] = fn;
+    return true;
 }
 
 void vfs_set_resolved_name_hook(vfs_resolved_name_hook_t fn)
@@ -41,7 +57,12 @@ void vfs_set_resolved_name_hook(vfs_resolved_name_hook_t fn)
 
 bool vfs_access_allowed(vfs_node_t node, const char *path, vfs_access_op_t op)
 {
-    return g_vfs_access_hook == NULL || g_vfs_access_hook(node, path, op);
+    for (int i = 0; i < g_vfs_access_hook_count; ++i)
+    {
+        vfs_access_hook_t hook = g_vfs_access_hooks[i];
+        if (hook != NULL && !hook(node, path, op)) return false;
+    }
+    return true;
 }
 
 void vfs_notify_resolved_name(vfs_node_t node, const char *name)
@@ -1672,4 +1693,5 @@ EXPORT_SYMBOL(vfs_mkdir);
 EXPORT_SYMBOL(normalize_path);
 EXPORT_SYMBOL_OBJECT(rootdir);
 EXPORT_SYMBOL(vfs_set_access_hook);
+EXPORT_SYMBOL(vfs_add_access_hook);
 EXPORT_SYMBOL(vfs_set_resolved_name_hook);
