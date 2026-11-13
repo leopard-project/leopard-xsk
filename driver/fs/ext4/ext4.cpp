@@ -603,20 +603,23 @@ int ext4fs_statfs(vfs_node_t node, struct statfs *result)
 {
     if (result == NULL) return -EINVAL;
     memset(result, 0, sizeof(*result));
-    for (Mount *mount = mounts; mount; mount = mount->next)
-    {
-        if (node != NULL && node->fsid != 0 && node->fsid != (uint16_t)mount->fsid) continue;
-        const xjext4::Volume &volume = mount->writer->view();
-        result->f_bsize = volume.block_size();
-        result->f_blocks = volume.blocks_count();
-        result->f_bfree = volume.free_blocks();
-        result->f_bavail = volume.free_blocks();
-        result->f_files = volume.inodes_count();
-        result->f_ffree = volume.free_inodes();
-        result->f_namelen = 255;
-        return 0;
-    }
-    return -ENODEV;
+    /* fsid identifies the filesystem driver, not the mount, so every ext4
+       mount shares it. Use the node's mount record to report the volume the
+       path actually lives on (root and /users are separate ext4 mounts). */
+    Mount *mount = NULL;
+    if (node != NULL && node->handle != NULL) mount = ((Node *)node->handle)->mount;
+    if (mount == NULL) mount = mounts;
+    if (mount == NULL || mount->writer == NULL) return -ENODEV;
+
+    const xjext4::Volume &volume = mount->writer->view();
+    result->f_bsize = volume.block_size();
+    result->f_blocks = volume.blocks_count();
+    result->f_bfree = volume.free_blocks();
+    result->f_bavail = volume.free_blocks();
+    result->f_files = volume.inodes_count();
+    result->f_ffree = volume.free_inodes();
+    result->f_namelen = 255;
+    return 0;
 }
 
 int ext4fs_sync(vfs_node_t node)

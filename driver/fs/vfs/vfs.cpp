@@ -1347,7 +1347,10 @@ static void tty_kernel_flush(tty_t *tty)
 static void tty_kernel_print(tty_t *tty, const char *msg)
 {
     (void)tty;
-    write_serial_fmt("%s", msg);
+    /* p_xapi_output_kernel already routes to the XTTTP terminal when one
+     * exists, and falls back to the serial/framebuffer console otherwise.
+     * Writing serial here as well would duplicate every line on the
+     * LeopardOS serial console (there is no separate terminal app). */
     p_xapi_output_kernel(msg);
 }
 
@@ -1355,7 +1358,6 @@ static void tty_kernel_putc(tty_t *tty, int c)
 {
     (void)tty;
     char buf[2] = {(char)c, '\0'};
-    write_serial_fmt("%s", buf);
     p_xapi_output_kernel(buf);
 }
 

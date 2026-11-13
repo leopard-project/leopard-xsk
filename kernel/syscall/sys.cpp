@@ -2,6 +2,7 @@
 #include <proto.hpp>
 #include <fs/vfs/vfs.h>
 #include <fs/fatfs/fatfs.h>
+#include <fs/ext4/ext4.h>
 #include <ioctl.h>
 #include <cpu/fsgsbase.h>
 #include <task/poll.h>
@@ -283,6 +284,11 @@ static uint64_t statfs_kernel_node(vfs_node_t node, struct statfs *buf)
     {
         struct statfs fatfs_buf;
         if (fatfs_statfs(node, &fatfs_buf) == EOK) kbuf = fatfs_buf;
+    }
+    else if (strcmp(filesystem->name, "ext4") == 0)
+    {
+        struct statfs ext4_buf;
+        if (ext4fs_statfs(node, &ext4_buf) == 0) kbuf = ext4_buf;
     }
 
     if (!copy_to_user_pagedir(current_user_pagedir(), buf, &kbuf, sizeof(kbuf))) return SYSCALL_FAULT_(EFAULT);
