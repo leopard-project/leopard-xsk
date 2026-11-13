@@ -138,6 +138,10 @@ struct process_control_block
     size_t   notify_pcor_tid;
     uint64_t notify_pcor_func;
     bool     notify_pcor_registered;
+
+    bool       screen_secret;      // Process-lifetime global capture prohibition.
+    bool       screen_raw_mapped;  // Live framebuffer mappings cannot be revoked by a syscall check.
+    pcb_t      screen_capture_next; // Intrusive policy list, protected by the capture state lock.
 };
 #ifndef CONFIG_USER_ELF_HEADER_START
 #define CONFIG_USER_ELF_HEADER_START 0x0000300000000000UL

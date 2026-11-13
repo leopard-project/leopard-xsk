@@ -19,6 +19,7 @@
 #include <openxj380/syscall.h>
 #include <pctable/gdt.h>
 #include <procfs.h>
+#include <screen_capture.h>
 #include <syscall/syscall.h>
 #include <task/ipc.h>
 
@@ -387,6 +388,7 @@ void kill_proc0(pcb_t pcb)
     OpenXJ380Socket_NotifyProcessExit(pcb);
 #endif
 
+    screen_capture_process_exit(pcb);
     procfs_on_exit_task(pcb);
 
     close_process_file_table(pcb);
@@ -1865,6 +1867,7 @@ static void free_owned_pointer_queue(lock_queue *queue)
 static void free_partial_process(pcb_t pcb, bool owns_pagedir)
 {
     if (pcb == NULL) return;
+    screen_capture_process_exit(pcb);
 
     if (pcb->parent_task != NULL && pcb->parent_task->child_pcb != NULL && pcb->child_index != (size_t)-1)
         queue_remove_data(pcb->parent_task->child_pcb, pcb);
@@ -2177,6 +2180,7 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
 
     new_task->window_count = 0;
 
+    screen_capture_process_inherit(current_pcb, new_pcb);
     procfs_on_new_task(new_pcb);
     if (add_task(new_task) == (size_t)-1)
     {

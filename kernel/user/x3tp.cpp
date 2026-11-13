@@ -33,6 +33,13 @@ void init_process_xtttp(pcb_t pcb)
 int check_terminal_init_status()
 {
     tcb_t current = get_current_task();
+    // Leopard services (mountd/getty/oobe) are started by PID1 rather than from a
+    // terminal, and the XACT 2026v5 CRT probes this for every process. Report
+    // "not a terminal" instead of dereferencing an absent parent/xtttp state.
+    if (current == NULL || current->parent_group == NULL ||
+        current->parent_group->parent_task == NULL ||
+        current->parent_group->parent_task->xtttp_stc == NULL)
+        return 0;
     return current->parent_group->parent_task->xtttp_stc->is_shell ? 1 : 0;
 }
 
@@ -40,6 +47,7 @@ void mark_process_is_terminal()
 {
     write_serial_fmt("Marking Terminal...\n");
     tcb_t current = get_current_task();
+    if (current == NULL || current->parent_group == NULL || current->parent_group->xtttp_stc == NULL) return;
     init_process_xtttp(current->parent_group);
     current->parent_group->xtttp_stc->is_shell = true;
     int sid = input_sink_register(&current->parent_group->xtttp_stc->sink);

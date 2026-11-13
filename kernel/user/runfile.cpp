@@ -38,7 +38,9 @@ static bool make_user_path(char *out, size_t out_size, const char *username, con
 
 bool init_user_dirs(const char *username)
 {
-    if (username == NULL || username[0] == '\0') return false;
+    // Reject traversal: account names anchor kernel-created per-user directories.
+    if (username == NULL || username[0] == '\0' || strchr(username, '/') || strchr(username, '\\') ||
+        !strcmp(username, ".") || !strcmp(username, "..")) return false;
 
     vfs_mkdir("/users");
 

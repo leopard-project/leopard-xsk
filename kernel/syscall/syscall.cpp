@@ -13,7 +13,9 @@
 #include <pipe.h>
 #include <proto.hpp>
 #include <rtc.h>
+#include <screen_capture.h>
 #include <syscall/signal.h>
+#include <syscall/xapi_user.h>
 #include <syscall/pxapi.h>
 #include <syscall/syscall.h>
 #include <task/poll.h>
@@ -672,6 +674,31 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case XAPI_PUT_TEXT_INBOX: case XAPI_GET_TEXT_INBOX: case XAPI_DEL_TEXT_INBOX:
     case XAPI_REG_RB_MENU: case XAPI_URG_RB_MENU: case XAPI_REFRESH_PART_WINDOW:
     case XAPI_GET_PIC_SIZE: case XAPI_CALC_TEXT_WIDTH:
+        regs->rax = (uint64_t)-ENOSYS;
+        break;
+    case XAPI_SET_SECRET:
+        regs->rax = (uint64_t)screen_capture_set_secret();
+        break;
+    // Interim permission primitives: no model yet, so everything is permitted.
+    case XAPI_LIFT_PERMISSIONS:
+    case XAPI_REQUEST_PERMISSIONS:
+    case XAPI_QUERY_FILE_ACCESS:
+    case XAPI_REQUEST_FILE_ACCESS:
+    case XAPI_REQUEST_SPECIAL_PERMISSION:
+        regs->rax = 0;
+        break;
+    case XAPI_GET_CURRENT_PERMISSIONS:
+    {
+        XapiPermissionSnapshot snapshot = {true, true, true, true, true, true, true};
+        page_directory_t *pagedir = xapi_current_pagedir();
+        regs->rax = pagedir &&
+            copy_to_user_pagedir(pagedir, (void *)regs->rdi, &snapshot, sizeof(snapshot)) ?
+                0 : (uint64_t)-EFAULT;
+        break;
+    }
+    case XAPI_SPAWN_INHERITED:
+        // Needs a kernel-side fork+exec with inherited identity; not wired yet.
+        // Existing components use XAPI_FORK/XAPI_EXECVE directly.
         regs->rax = (uint64_t)-ENOSYS;
         break;
     case XAPI_GET_VERSION: do_xapi_GetSystemVersion(regs->rdi); break;
