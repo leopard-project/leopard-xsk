@@ -68,6 +68,10 @@ void permissions_set_backend(bool available);
 bool permissions_file_access(vfs_node_t node, const char *path, vfs_access_op_t op);
 bool permissions_vfs_hook(vfs_node_t node, const char *path, vfs_access_op_t op);
 
+// Last denial on this thread, so callers can preserve EACCES instead of EIO.
+int  permissions_file_error();
+void permissions_clear_file_error();
+
 // XAPI_QUERY_FILE_ACCESS / XAPI_REQUEST_FILE_ACCESS helper.
 // Returns 0 when permitted, a positive missing-bit mask, or a negative errno.
 int permissions_query_file(const char *path, uint64_t access);

@@ -413,8 +413,21 @@ static int check_path(vfs_node_t node, const char *path, AccessKind kind)
     return missing;
 }
 
+int permissions_file_error()
+{
+    tcb_t task = get_current_task();
+    return task != NULL ? task->file_access_error : 0;
+}
+
+void permissions_clear_file_error()
+{
+    tcb_t task = get_current_task();
+    if (task != NULL) task->file_access_error = 0;
+}
+
 bool permissions_file_access(vfs_node_t node, const char *path, vfs_access_op_t op)
 {
+    permissions_clear_file_error();
     AccessKind kind = ACCESS_READ;
     switch (op)
     {
@@ -424,7 +437,13 @@ bool permissions_file_access(vfs_node_t node, const char *path, vfs_access_op_t 
     case VFS_ACCESS_MOUNT: kind = ACCESS_MOUNT; break;
     default: return true;
     }
-    return check_path(node, path, kind) == 0;
+    bool allowed = check_path(node, path, kind) == 0;
+    if (!allowed)
+    {
+        tcb_t task = get_current_task();
+        if (task != NULL) task->file_access_error = EACCES;
+    }
+    return allowed;
 }
 
 bool permissions_vfs_hook(vfs_node_t node, const char *path, vfs_access_op_t op)

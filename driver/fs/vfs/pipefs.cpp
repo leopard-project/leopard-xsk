@@ -68,7 +68,8 @@ static void pipe_wait_on(pipe_info_t *pipe, task_block_list_t *head) {
 void pipefs_open(void *parent, const char *name, vfs_node_t node) {
     (void)parent;
     (void)name;
-    node->type = file_pipe;
+    // The pipefs mount root is a directory; only its children are endpoints.
+    node->type = node == pipefs_root ? file_dir : file_pipe;
 }
 
 size_t pipefs_read(void *file, void *addr, size_t offset, size_t size) {
@@ -235,6 +236,9 @@ int pipefs_poll(void *file, size_t events) {
 
 int pipefs_mount(const char *handle, vfs_node_t node) {
     if ((uint64_t)handle != PIEFS_REGISTER_ID) return VFS_STATUS_FAILED;
+    // The mount root keeps directory semantics even if it covered a file node.
+    node->type  = file_dir;
+    node->size  = 0;
     node->fsid  = pipefs_id;
     pipefs_root = node;
     return VFS_STATUS_SUCCESS;
@@ -245,7 +249,15 @@ static int dummy() {
 }
 
 errno_t pipefs_stat(void *file, vfs_node_t node) {
+    if (node == NULL) return -EINVAL;
+    if (node == pipefs_root)
+    {
+        node->type = file_dir;
+        node->size = 0;
+        return EOK;
+    }
     pipe_specific_t *spec = (pipe_specific_t *)file;
+    if (spec == NULL) return EOK;
     pipe_info_t     *pipe = spec->info;
     if(pipe == NULL) return EOK;
     node->size = pipe->ptr;

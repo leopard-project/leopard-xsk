@@ -526,8 +526,16 @@ static int read_vfs_file(vfs_node_t file, uint8_t **out, uint64_t *out_size)
     size_t got = vfs_read(file, buf, 0, size);
     if (got != size)
     {
+        // Preserve the access error so a denied image read reports EACCES
+        // instead of the generic EIO.
+        int error = permissions_file_error();
+        write_serial_fmt("ELF: read incomplete inode=%llu requested=%llu returned=%llu current-size=%llu "
+                         "type=%u fsid=%u error=%d\n",
+                         (unsigned long long)file->inode, (unsigned long long)size,
+                         (unsigned long long)got, (unsigned long long)file->size,
+                         (unsigned)file->type, (unsigned)file->fsid, error);
         free_file_image(buf, size);
-        return -EIO;
+        return error ? -error : -EIO;
     }
 
     *out = buf;

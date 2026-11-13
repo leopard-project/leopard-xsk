@@ -221,6 +221,7 @@ struct thread_control_block
     uint64_t eevdf_slice;
     uint64_t eevdf_last_start;
     uint64_t runtime_ticks;
+    int      file_access_error; // Last VFS access denial (EACCES), cleared per operation.
 
     bool owns_user_stack;
 };
