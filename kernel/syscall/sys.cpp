@@ -4217,7 +4217,7 @@ sys_(mount, char *dev_name, char *dir_name, char *type, uint64_t flags, void *da
     free(udev_name);
     if (ndev_name == NULL) { free(ndir_name); return SYSCALL_FAULT_(ENOMEM); }
 mount:
-    if (vfs_mount((const char *)ndev_name, dir) == VFS_STATUS_FAILED)
+    if (vfs_mount_as(filesystem, (const char *)ndev_name, dir) == VFS_STATUS_FAILED)
     {
         free(ndir_name);
         free(ndev_name);

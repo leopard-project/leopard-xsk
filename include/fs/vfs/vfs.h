@@ -376,6 +376,8 @@ void *general_map(vfs_read_t read_callback, void *file, uint64_t addr, uint64_t 
  * @return 非0代表挂载失败
  */
 errno_t vfs_mount(const char *src, vfs_node_t node);
+// 指定文件系统挂载（fstype 精确匹配，不再试遍所有回调）
+errno_t vfs_mount_as(vfs_filesystem_t fs, const char *src, vfs_node_t node);
 
 /**
  * 卸载一个挂载点

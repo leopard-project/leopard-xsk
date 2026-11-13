@@ -1006,12 +1006,23 @@ void vfs_free_child(vfs_node_t vfs) {
     list_free_with(child, (void (*)(void *))vfs_free);
 }
 
+errno_t vfs_mount_as(vfs_filesystem_t fs, const char *src, vfs_node_t node) {
+    if (fs == NULL || fs->callback == NULL || fs->callback->mount == NULL) return VFS_STATUS_FAILED;
+    if (!vfs_access_allowed(node, NULL, VFS_ACCESS_MOUNT)) return VFS_STATUS_FAILED;
+    if (node == NULL || node->type != file_dir) return VFS_STATUS_FAILED;
+    if (fs->callback->mount(src, node) != 0) return VFS_STATUS_FAILED;
+    node->fsid     = fs->fsid;
+    node->root     = node;
+    node->is_mount = true;
+    return VFS_STATUS_SUCCESS;
+}
+
 errno_t vfs_mount(const char *src, vfs_node_t node) {
     if (!vfs_access_allowed(node, NULL, VFS_ACCESS_MOUNT)) return VFS_STATUS_FAILED;
-    if (node == NULL) return VFS_STATUS_FAILED;
-    if (node->type != file_dir) return VFS_STATUS_FAILED;
+    if (node == NULL || node->type != file_dir) return VFS_STATUS_FAILED;
     for (int i = 1; i < fs_nextid; i++) {
-        if (fs_callbacks[i]->mount(src, node) == 0) {
+        if (fs_callbacks[i] != NULL && fs_callbacks[i]->mount != NULL &&
+            fs_callbacks[i]->mount(src, node) == 0) {
             node->fsid     = i;
             node->root     = node;
             node->is_mount = true;

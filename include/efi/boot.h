@@ -3,6 +3,7 @@
 #include <efi/efi.h>
 #include <mm/memory.h>
 #include <smp/smp.h>
+#include <efi/root_binding.h>
 
 #define BOOT_FLAG_SAFE_MODE        (1ULL << 0)
 #define BOOT_FLAG_VERBOSE          (1ULL << 1)
@@ -13,6 +14,7 @@
 #define BOOT_FLAG_SHOW_PROGRESS    (1ULL << 6)
 #define BOOT_FLAG_INSTALLER        (1ULL << 7)
 #define BOOT_FLAG_LIVE_ROOT        (1ULL << 8) /* live 介质：root 来自 RAM（引导器载入 pak） */
+#define BOOT_FLAG_BOUND_ROOT       (1ULL << 9) /* ESP root.bin 指定 ext4/FAT32 根分区 */
 
 #define BOOT_CONFIG_INIT_MAX 256  /* PID1 init 路径缓冲区长度 */
 
@@ -39,6 +41,7 @@ typedef struct
     uint64_t system_payload_pak_size;
 
     char init[BOOT_CONFIG_INIT_MAX]; /* PID1 路径：引导器从 boot.conf 读入 */
+    XJ_ROOT_BINDING root_binding;    /* BOOT_FLAG_BOUND_ROOT 时由引导器填入 */
 } BOOT_CONFIG;
 
 #endif

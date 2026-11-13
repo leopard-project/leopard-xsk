@@ -11,6 +11,7 @@
 #include <fs/fatfs/fatfs.h>
 #include <fs/partition.h>
 #include <fs/vfs/devfs.h>
+#include <fs/ext4/ext4.h>
 #include <fs/vfs/vfs.h>
 #include <hda/hda.h>
 #include <hda/pcspk.h>
@@ -500,6 +501,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     xhci_start_workers();
 #endif
 
+    ext4fs_init();
     bool installer_mode = installer_boot_active(BootConfig);
     if (installer_mode)
         installer_prepare_root(BootConfig);
