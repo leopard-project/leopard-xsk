@@ -48,6 +48,10 @@ uint8_t permissions_grade_mask(UserType type)
 
 static uint8_t mask_of(const UserInfo *user)
 {
+    // A missing permissions.conf disables the model entirely (allow all),
+    // matching permissions_file_access(); do not report an empty mask here,
+    // otherwise syscalls such as XAPI_POWER_ACTION's preflight fail.
+    if (!policy_loaded) return XPERM_ALL;
     if (user == NULL) return 0;
     if (user->user_type == XUT_Custom) return user_permission_mask(user->user_prms);
     uint8_t grade = permissions_grade_mask(user->user_type);
