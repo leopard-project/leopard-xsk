@@ -570,14 +570,19 @@ void module_setup() {
         }
         extract_name(buf, module_ls[module_count].module_name, sizeof(char) * 20);
         module_ls[module_count].path = buf;
-        uint8_t *data = dlinker_read_entire_file(ch);
+        /* Child nodes from ext4 may not have fetched inode size yet. Open the
+           path so vfs_open() runs do_update(), then read that node. */
+        vfs_node_t module_file = vfs_open(buf);
+        uint8_t *data = module_file ? dlinker_read_entire_file(module_file) : NULL;
+        size_t module_size = module_file ? module_file->size : 0;
+        if (module_file) vfs_close(module_file);
         if (data == NULL) {
             write_serial_fmt("kmod: Failed to read %s\n", buf);
             free(buf);
             continue;
         }
         module_ls[module_count].data = data;
-        module_ls[module_count].size = ch->size;
+        module_ls[module_count].size = module_size;
         snprintf(module_ls[module_count].raw_name, sizeof(module_ls[module_count].raw_name), "%s", buf);
         module_ls[module_count].is_use = true;
         write_serial_fmt("kmod: Module %s %s\n", module_ls[module_count].module_name, buf);

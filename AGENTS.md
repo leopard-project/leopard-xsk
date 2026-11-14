@@ -176,7 +176,12 @@ Build env vars: `COMPILER_PREFIX`, `CC`, `CPP`, `NASM`, `LD`, `OBJC`,
 - dlinker 用 `dlinker_mangled_global_matches` 把 kmod 的 C++ mangled 符号匹配到导出名。
 
 ### kmod 加载
-- `kmod/ime/ime.cpp` 是占位 skeleton（dlmain 注册空 interceptor + syscall hook）；真实业务在 ime-kmod。
+- 树内模块位于 `kmod/<name>/`，统一构建到 `out/kmod/<name>-kmod.sys`；`ninja kmods` 构建全部，
+  `ninja pack-kmods` 生成独立 `<name>-kmod` 包，不并入内核包。
+- 当前树内模块：`e1000`（网卡）、`netserver`（lwIP）、`xhci`（USB）；`kmod/ime` 是
+  `package=0` 的兼容 skeleton，真实 IME 业务在 `ime-kmod`。
+- `module_setup` 对 `/mod` 下的节点先 `vfs_open()` 再读取，触发 ext4 懒 inode 更新；
+  否则 child 节点 `size=0` 会导致模块读取失败。
 - dlinker 经 `find_export(handle, "dlmain")` 定位入口；`dlmain`/`dlstart` 必须 unmangled +
   `visibility("default")`（编译 flags `-fvisibility=hidden` 下只有它们导出）。
 

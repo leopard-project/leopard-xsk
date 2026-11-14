@@ -1,3 +1,4 @@
+#include <dlinker.h>
 #include <cpu/regio.h>
 #include <openxj380/config.h>
 #include <openxj380/socket.h>
@@ -235,3 +236,5 @@ void set_mouse_position(int x, int y)
     g_mouse.y = y;
 #endif
 }
+
+EXPORT_SYMBOL(mouse_inject_report);

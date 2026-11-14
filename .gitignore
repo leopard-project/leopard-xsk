@@ -63,3 +63,6 @@ venv/
 
 # xbps package staging
 .pkg/
+
+# kernel module package staging
+.pkg-kmod-*/
