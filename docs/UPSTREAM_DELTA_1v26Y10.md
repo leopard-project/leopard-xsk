@@ -231,3 +231,27 @@ Leopard 目前全部静态 ELF，暂不需要；若将来要用 XACT 的动态 S
 
 3. **`insw` 编译器屏障**（`214d373`）
    - `asm volatile("cld; rep; insw" ... : "memory")`，防止编译器把内存访问重排到端口 I/O 两侧。
+
+---
+
+# 第四部分：`93d76a7` → `2422496`（2026-11-13 晚）
+
+> 范围：3 个非 merge 提交（`26d8676`、`ce9352f`、`69827b4`）。
+> 结论：2 处内核修复已移植；语言 ID 与安装器身份生成归用户态。
+
+## 10. 分类
+
+| 提交 | 主题 | 归属 | 处理 |
+|---|---|---|---|
+| `69827b4` | 启动交接前先发布 IRQ 策略 | **内核原语** | ✅ 已移植（`main.cpp` 中 `no_interrupt=false` 提前到 `scheduler_start()` 之前） |
+| `ce9352f`（部分） | CPUID 最大叶号保护 `rdseed/rdrand` | **内核原语** | ✅ 已移植（`rng.cpp` 的 `try_rdseed64`/`try_rdrand64`，叶 1 前检查 `maximum_leaf >= 1`） |
+| `ce9352f`（其余） | `get_identifier_random_bytes()` 软件兜底、安装器身份生成 | 安装器业务 | ❌ 不移植（Leopard 安装器在用户态，且有独立随机源） |
+| `26d8676` | 7 种语言 ID、settings 归一化、profile 种子 | 用户态/产品策略 | ❌ 暂不移植（内核只保留 zh/en 常量；等 OOBE 多语言需求） |
+| `26d8676`（工具） | `native_rtld.py` 允许产品追加源/依赖 | 构建工具 | ❌ 不移植（Leopard SDK 独立构建） |
+
+## 11. 备注
+
+- 本批上游继续把安装器下沉到 `kernel/installer` 与 `boot/bootx64.c`，与 Leopard 的
+  “内核只留原语、安装器在用户态” 拆分相反，后续同类提交默认按安装器业务过滤。
+- `ce9352f` 的 `get_hardware_random_bytes()` 严格硬件熵接口未引入：本树
+  `get_random_bytes()` 已是“硬件优先 + ChaCha20 软件池”，安装器身份码由用户态生成。

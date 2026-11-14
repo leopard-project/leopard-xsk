@@ -73,31 +73,46 @@ static uint64_t splitmix64(uint64_t *state)
     return z ^ (z >> 31);
 }
 
+// Keep optional instructions behind the current CPU's CPUID checks below.
+static bool try_rdseed64(uint64_t *value)
+{
+    unsigned char ok;
+    __asm__ volatile("rdseed %0; setc %1" : "=r"(*value), "=qm"(ok)::"cc");
+    return ok != 0;
+}
+
+static bool try_rdrand64(uint64_t *value)
+{
+    unsigned char ok;
+    __asm__ volatile("rdrand %0; setc %1" : "=r"(*value), "=qm"(ok)::"cc");
+    return ok != 0;
+}
+
 static bool hardware_random64(uint64_t *value)
 {
     uint32_t eax, ebx, ecx, edx;
     asm_cpuid(0, 0, &eax, &ebx, &ecx, &edx);
-    if (eax >= 7)
+    const uint32_t maximum_leaf = eax;
+    if (maximum_leaf >= 7)
     {
         asm_cpuid(7, 0, &eax, &ebx, &ecx, &edx);
         if ((ebx & (1U << 18)) != 0)
         {
             for (unsigned i = 0; i < 10; ++i)
             {
-                unsigned char ok;
-                __asm__ volatile("rdseed %0; setc %1" : "=r"(*value), "=qm"(ok)::"cc");
-                if (ok) return true;
+                if (try_rdseed64(value)) return true;
             }
         }
     }
-    asm_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
-    if ((ecx & (1U << 30)) != 0)
+    if (maximum_leaf >= 1)
     {
-        for (unsigned i = 0; i < 10; ++i)
+        asm_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
+        if ((ecx & (1U << 30)) != 0)
         {
-            unsigned char ok;
-            __asm__ volatile("rdrand %0; setc %1" : "=r"(*value), "=qm"(ok)::"cc");
-            if (ok) return true;
+            for (unsigned i = 0; i < 10; ++i)
+            {
+                if (try_rdrand64(value)) return true;
+            }
         }
     }
     return false;
