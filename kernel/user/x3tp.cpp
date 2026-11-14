@@ -34,39 +34,25 @@ int check_terminal_init_status()
 {
     tcb_t current = get_current_task();
     // Leopard services (mountd/getty/oobe) are started by PID1 rather than from a
-    // terminal, and the XACT 2026v5 CRT probes this for every process. Walk the
-    // parent chain so a child of a shell still sees the owning getty.
-    if (current == NULL || current->parent_group == NULL) return 0;
-
-    pcb_t process = current->parent_group->parent_task;
-    while (process != NULL && process != kernel_group) {
-        if (process->xtttp_stc != NULL && process->xtttp_stc->is_shell) return 1;
-        process = process->parent_task;
-    }
-    return 0;
+    // terminal, and the XACT 2026v5 CRT probes this for every process. Report
+    // "not a terminal" instead of dereferencing an absent parent/xtttp state.
+    if (current == NULL || current->parent_group == NULL ||
+        current->parent_group->parent_task == NULL ||
+        current->parent_group->parent_task->xtttp_stc == NULL)
+        return 0;
+    return current->parent_group->parent_task->xtttp_stc->is_shell ? 1 : 0;
 }
 
-int mark_process_is_terminal()
+void mark_process_is_terminal()
 {
-    tcb_t current = get_current_task();
-    if (current == NULL || current->parent_group == NULL || current->parent_group->xtttp_stc == NULL)
-        return -EINVAL;
-
-    // A nested getty/terminal must not steal the existing console's focus.
-    pcb_t ancestor = current->parent_group->parent_task;
-    while (ancestor != NULL && ancestor != kernel_group) {
-        if (ancestor->xtttp_stc != NULL && ancestor->xtttp_stc->is_shell)
-            return -EALREADY;
-        ancestor = ancestor->parent_task;
-    }
-
     write_serial_fmt("Marking Terminal...\n");
+    tcb_t current = get_current_task();
+    if (current == NULL || current->parent_group == NULL || current->parent_group->xtttp_stc == NULL) return;
     init_process_xtttp(current->parent_group);
     current->parent_group->xtttp_stc->is_shell = true;
     int sid = input_sink_register(&current->parent_group->xtttp_stc->sink);
     if (sid >= 0)
         input_sink_set_focus((uint32_t)sid);
-    return 0;
 }
 
 int check_input_waiting_status()

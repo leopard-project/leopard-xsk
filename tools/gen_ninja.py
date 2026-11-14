@@ -172,7 +172,7 @@ def main():
     L += ["build pack-kmods: phony " + " ".join(esc(x) for x in all_mod_pkgs), ""]
 
     # ---- xbps 打包（pack）----
-    pkg = {"name": "OpenXSKernel", "ver": "2.1.1_3", "arch": "x86_64",
+    pkg = {"name": "OpenXSKernel", "ver": "2.1.1_2", "arch": "x86_64",
            "desc": "Leopard kernel", "install": "system/kernel.krl"}
     pkg_args = f"-A {pkg['arch']} -n {pkg['name']}-{pkg['ver']} -s '{pkg['desc']}'"
     xbps_out = f"out/{pkg['name']}-{pkg['ver']}.{pkg['arch']}.xbps"
