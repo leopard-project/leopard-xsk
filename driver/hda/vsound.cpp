@@ -9,6 +9,10 @@
 
 #define DR_MP3_IMPLEMENTATION
 #define DR_MP3_NO_STDIO
+/* dr_mp3's default assert is (expression), which clang flags as an unused
+ * value.  Evaluate the expression but discard it, without touching the
+ * vendored header. */
+#define DRMP3_ASSERT(expression) ((void)(expression))
 #include "dr_mp3.h"
 
 static rbtree_sp_t vsound_list;

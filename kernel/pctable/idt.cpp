@@ -17,12 +17,11 @@ void init_idt_desc(uint8_t number, uint8_t gate_type, int_func function, uint8_t
 void init_idt()
 {
     write_serial_string("Initializing IDT...\n");
-    // 初始化IDTR寄存器和门描述符
-    uint16_t *p_idt_limit = (uint16_t *)(&idt_ptr.size);
-    uint64_t *p_idt_base  = (uint64_t *)(&idt_ptr.base);
-
-    *p_idt_limit = IDT_SIZE * sizeof(IDT_GATE_TYPE) - 1;
-    *p_idt_base  = (uint64_t)(&idt_gate);
+    // 初始化IDTR寄存器和门描述符。IDTR_TYPE 是 packed，base 位于偏移 1，
+    // 不能取成员地址再解引用（未对齐指针 / 严格别名 UB）；直接赋值让编译器
+    // 生成 packed 成员访问。
+    idt_ptr.size = IDT_SIZE * sizeof(IDT_GATE_TYPE) - 1;
+    idt_ptr.base = (uint64_t)(&idt_gate);
 
     for (int i = 0; i < IDT_SIZE; i++)
     {

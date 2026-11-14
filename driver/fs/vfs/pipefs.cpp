@@ -276,14 +276,14 @@ static struct vfs_callback pipefs_callbacks = {
     .mkfile   = (vfs_mk_t)empty,
     .link     = (vfs_mk_t)dummy,
     .symlink  = (vfs_mk_t)dummy,
-    .del   = (vfs_del_t)empty,
-    .rename   = (vfs_rename_t)empty,
-    .map      = (vfs_mapfile_t)empty,
     .stat     = pipefs_stat,
     .ioctl    = (vfs_ioctl_t)pipefs_ioctl,
-    .poll     = pipefs_poll,
     .dup      = (vfs_dup_t)empty,
+    .poll     = pipefs_poll,
+    .map      = (vfs_mapfile_t)empty,
     .resize   = (vfs_resize_t)dummy,
+    .del      = (vfs_del_t)empty,
+    .rename   = (vfs_rename_t)empty,
 };
 
 void pipefs_setup() {
