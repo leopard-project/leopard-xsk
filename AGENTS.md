@@ -175,6 +175,18 @@ Build env vars: `COMPILER_PREFIX`, `CC`, `CPP`, `NASM`, `LD`, `OBJC`,
   `vfs_set_access_hook`/`vfs_set_resolved_name_hook`。
 - dlinker 用 `dlinker_mangled_global_matches` 把 kmod 的 C++ mangled 符号匹配到导出名。
 
+### LeopardOS console host（getty）
+- `keyboard_dispatch_key_message()` 把 `MSG_KEYDOWN` 的可打印/控制字节通过
+  `input_route_dispatch(MSG_CHAR, ...)` 投递到焦点 XTTTP sink；`XAPI_GETCH`
+  直接从 sink 读键。
+- `p_xapi_output_kernel()` 对“终端 owner 自己”的输出去 console/serial；子进程仍写入
+  `xtttp->output`，由 getty 的 console host 循环读取并渲染。
+- getty 只使用既有原语：`SXAH_MARK_IS_TERMINAL`、`SXAH_READ_OUTPUT_BUFFER`、
+  `SXAH_CHECK_INPUT_BUFFER`、`SXAH_WRITE_INPUT_BUFFER`、`SXAH_UNLOCK_OUTPUT_LOCK`、
+  `XAPI_GETCH`、`XAPI_PRINTF`。
+- `is_shell` 仍由 `SXAH_MARK_IS_TERMINAL` 设置；getty 负责终端循环，shell 不再直接 exec。
+- 屏幕尺寸通过 `/dev/tty` 的 `TIOCGWINSZ` 获取，不在内核新增尺寸原语。
+
 ### kmod 加载
 - 树内模块位于 `kmod/<name>/`，统一构建到 `out/kmod/<name>-kmod.sys`；`ninja kmods` 构建全部，
   `ninja pack-kmods` 生成独立 `<name>-kmod` 包，不并入内核包。

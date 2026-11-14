@@ -4,6 +4,7 @@
 #include <openxj380/config.h>
 #include <openxj380/socket.h>
 #include <syscall/syscall.h>
+#include <syscall/pxapi.h>
 
 struct keyboard_buf kb_fifo;
 static atom_queue kb_fifo_queue;
@@ -290,8 +291,16 @@ uint8_t keyboard_translate_event_value(uint8_t make_code, bool extended,
 
 extern "C" void keyboard_dispatch_key_message(uint64_t msg_type, uint8_t value)
 {
+#if !OPENXJ380_INPUT_OUTPUT_DISABLED
+    /* Feed printable/control bytes into the focused XTTTP sink.  Special
+     * keys (>=128) stay out of the byte stream until keypad encoding is
+     * defined; login/console input uses XAPI_INPUT's raw fallback. */
+    if (msg_type == MSG_KEYDOWN && value != 0 && value < 128)
+        input_route_dispatch(MSG_CHAR, 0, (uint64_t)value, NULL, NULL);
+#else
     (void)msg_type;
     (void)value;
+#endif
 }
 
 static void keyboard_update_modifier_state(uint8_t make_code, bool extended, bool pressed)

@@ -24,6 +24,8 @@
 #include <user/settings.h>
 #include <user/user.h>
 #include <errno.h>
+#include <input_sink.h>
+#include <ps2/keyboard.h>
 
 extern UserInfo *current_user;
 extern lock_queue *pcb_group_queue;
@@ -104,6 +106,14 @@ void p_xapi_output_kernel(const char *str)
         }
         if (front_p->xtttp_stc->is_shell)
         {
+            /* The terminal owner (getty console host) renders child output
+             * directly.  Child processes still write into the terminal's
+             * xtttp output buffer. */
+            if (front_p == get_current_task()->parent_group) {
+                write_serial_string(str);
+                return;
+            }
+
             // found it!
             if (str == NULL) {
                 return;
