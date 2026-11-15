@@ -11,6 +11,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
+#include <abi/posix.h>
 #if defined(XJ380)
 #include <graphics/window/window.h>
 #endif
@@ -207,6 +208,23 @@ pcb_t found_pcb(int pid)
     return ret;
 }
 
+pcb_t found_pgrp(int pgid)
+{
+    if (pcb_group_queue == NULL || pgid <= 0) return NULL;
+    pcb_t ret = NULL;
+    spin_lock(&pcb_group_queue->lock);
+    queue_foreach(pcb_group_queue, node)
+    {
+        pcb_t pcb = (pcb_t)node->data;
+        if (pcb == NULL || pcb->pgid != (size_t)pgid) continue;
+        if (pcb->status == DEATH || pcb->status == OUT || pcb->status == ZOMBIE) continue;
+        ret = pcb;
+        break;
+    }
+    spin_unlock(&pcb_group_queue->lock);
+    return ret;
+}
+
 pcb_t found_process_by_exe_path(const char *exe_path)
 {
     if (pcb_group_queue == NULL || exe_path == NULL || exe_path[0] == '\0') return NULL;
@@ -249,9 +267,28 @@ tcb_t found_thread(pcb_t pcb, int tid)
 void kill_proc(pcb_t pcb, int exit_code, bool is_zombie)
 {
     if (pcb == NULL) return;
-    if (pcb->pid == kernel_group->pid)
+    if (kernel_group == NULL || pcb->pid == kernel_group->pid)
     {
         write_serial_fmt("Cannot kill System process.");
+        return;
+    }
+
+    /*
+     * PID1 (init) and kernel-level tasks are infrastructure: an external
+     * teardown panics or wedges the machine, so it is rejected for every
+     * caller (XAPI_KILL_PROCESS, kernel control paths, etc.).
+     *
+     * A process tearing down *itself* must stay possible: sys_exit/exit_group,
+     * the page-fault handler and fatal signal delivery all call
+     * kill_proc(current_task->parent_group, code, true). A self exit is a
+     * normal lifecycle event even for PID1, so only reject external kills.
+     */
+    tcb_t current = get_current_task();
+    bool  self    = current != NULL && pcb == current->parent_group;
+    if (!self && (pcb->pid == 1 || pcb->task_level != TASK_APPLICATION_LEVEL))
+    {
+        write_serial_fmt("task: refusing to kill protected process %s (PID: %zu, level %d)\n",
+                         pcb->name, pcb->pid, pcb->task_level);
         return;
     }
 
@@ -411,7 +448,7 @@ void kill_proc0(pcb_t pcb)
     void *elf_file = pcb->elf_file;
     char **envp = pcb->envp;
     tty_t *tty = pcb->tty;
-    xtttp_dtt *xtttp = pcb->xtttp_stc;
+    x3tp_terminal_t *terminal = pcb->terminal;
     char name[sizeof(pcb->name)];
     memset(name, 0, sizeof(name));
     strncpy(name, pcb->name, sizeof(name) - 1);
@@ -440,7 +477,7 @@ void kill_proc0(pcb_t pcb)
     if (envp) free_envp(envp);
     if (!vfork && pagedir != NULL && pagedir != get_kernel_pagedir()) free_page_directory(pagedir);
     free_tty(tty);
-    free(xtttp);
+    free(terminal);
     free(pcb);
     write_serial_fmt("task: Freeing process %s (PID: %d) vfork: %s\n", name, pid,
                      vfork ? "true" : "false");
@@ -1398,6 +1435,11 @@ uint64_t process_execve(char *path, char **argv, char **envp)
         restore_runtime_state(scheduler_depth, is_sti);
         return (uint64_t)-ENOENT;
     }
+    /* setuid 语义只看 ELF 本体：脚本的 #! 解释器不继承 setuid 位。 */
+    vfs_node_t exec_node = node;
+    uint32_t   exec_mode = vfs_node_mode(node);
+    uint32_t   exec_owner = node->owner;
+
     int shebang_ret = rewrite_shebang_exec(&node, &norm_path, &kargv, &kargc);
     if (shebang_ret < 0)
     {
@@ -1647,6 +1689,15 @@ uint64_t process_execve(char *path, char **argv, char **envp)
      * create_thread_lock or this scheduler-disabled section.
      */
     permissions_process_exec(process);
+    /* S_ISUID：把进程身份切到文件所有者对应的 XUT。
+       - S_ISGID 不单独处理：XSK 的 gid 恒等于 uid；
+       - shebang 已把 node 换成解释器时跳过（脚本不继承 setuid）。 */
+    if ((exec_mode & 04000U) != 0 && node == exec_node)
+    {
+        UserInfo exec_identity;
+        if (user_identity_from_uid(exec_owner, &exec_identity))
+            permissions_process_switch_identity(process, &exec_identity);
+    }
     bool was_vfork = process->vfork;
     lock_queue *old_virt_queue = process->virt_queue;
     vma_manager_t old_vma_manager = process->vma_manager;
@@ -1888,7 +1939,7 @@ static void free_partial_process(pcb_t pcb, bool owns_pagedir)
     free(pcb->cmdline);
     free_envp(pcb->argv);
     free(pcb->exe_path);
-    free(pcb->xtttp_stc);
+    free(pcb->terminal);
     free(pcb);
 }
 
@@ -1999,6 +2050,7 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     memset(new_pcb, 0, sizeof(struct process_control_block));
     new_pcb->queue_index = (size_t)-1;
     new_pcb->child_index = (size_t)-1;
+    new_pcb->umask       = current_pcb != NULL ? current_pcb->umask : 022;
     permissions_process_init(new_pcb, current_pcb, XPCS_INHERIT);
     new_pcb->pid = alloc_pid();
     strcpy(new_pcb->name, current_pcb->name);
@@ -2007,6 +2059,10 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     new_pcb->status     = START;
     new_pcb->vfork      = is_vfork;
     new_pcb->ppid       = current_pcb->pid;
+    // fork/clone inherit the session and process group; only the PID is new.
+    // A child forked from a kernel-side group (sid/pgid 0) starts its own.
+    new_pcb->sid        = current_pcb->sid != 0 ? current_pcb->sid : new_pcb->pid;
+    new_pcb->pgid       = current_pcb->pgid != 0 ? current_pcb->pgid : new_pcb->pid;
     new_pcb->linux_abi  = current_pcb->linux_abi;
     new_pcb->load_start = current_pcb->load_start;
     new_pcb->aux_phdr   = current_pcb->aux_phdr;
@@ -2060,20 +2116,21 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     new_pcb->ipc_queue    = queue_init();
     new_pcb->tty          = alloc_default_tty();
 
-    new_pcb->xtttp_stc = (xtttp_dtt *)malloc(sizeof(xtttp_dtt));
+    new_pcb->terminal = (x3tp_terminal_t *)malloc(sizeof(x3tp_terminal_t));
+    if (new_pcb->terminal != NULL) memset(new_pcb->terminal, 0, sizeof(x3tp_terminal_t));
     if (new_pcb->cmdline == NULL || (current_pcb->argc > 0 && new_pcb->argv == NULL) ||
         (current_pcb->exe_path != NULL && new_pcb->exe_path == NULL) ||
         new_pcb->thread_queue == NULL || new_pcb->child_pcb == NULL ||
         new_pcb->virt_queue == NULL || new_pcb->file_open == NULL || new_pcb->file_open_shared_refs == NULL ||
         new_pcb->ipc_queue == NULL ||
-        new_pcb->tty == NULL || new_pcb->xtttp_stc == NULL)
+        new_pcb->tty == NULL || new_pcb->terminal == NULL)
     {
         free_partial_process(new_pcb, !is_vfork);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
         return (uint64_t)-ENOMEM;
     }
-    memset(new_pcb->xtttp_stc, 0, sizeof(xtttp_dtt));
+    memset(new_pcb->terminal, 0, sizeof(x3tp_terminal_t));
 
     new_pcb->queue_index = queue_enqueue(pcb_group_queue, new_pcb);
     if (new_pcb->queue_index == (size_t)-1)
@@ -2647,6 +2704,11 @@ pcb_t create_process_group_as(const char *name, pcb_t parent, page_directory_t *
     }
 
     pcb->pid         = alloc_pid();
+    // A process group created from the kernel (PID1, login/getty, runfile) starts
+    // as its own session and process-group leader. Userspace may call setsid()
+    // later only if it is not already a group leader.
+    pcb->sid         = pcb->pid;
+    pcb->pgid        = pcb->pid;
     pcb->parent_task = parent_group;
     pcb->status      = START;
     pcb->task_level  = TASK_APPLICATION_LEVEL;
@@ -2655,6 +2717,7 @@ pcb_t create_process_group_as(const char *name, pcb_t parent, page_directory_t *
     pcb->notify_pcor_tid           = 0;
     pcb->notify_pcor_func          = 0;
     pcb->notify_pcor_registered    = false;
+    pcb->umask                     = 022;
     permissions_process_init(pcb, parent_group, (ProcessCredentialSource)credential_source);
     pcb->queue_index = queue_enqueue(pcb_group_queue, pcb);
     if (pcb->queue_index == (size_t)-1)
@@ -2752,8 +2815,9 @@ pcb_t create_process_group_as(const char *name, pcb_t parent, page_directory_t *
     pcb->mmap_start  = USER_MMAP_START;
     // pcb->msgprci = false;
 
-    pcb->xtttp_stc = (xtttp_dtt *)malloc(sizeof(xtttp_dtt));
-    if (pcb->xtttp_stc == NULL)
+    pcb->terminal = (x3tp_terminal_t *)malloc(sizeof(x3tp_terminal_t));
+    if (pcb->terminal != NULL) memset(pcb->terminal, 0, sizeof(x3tp_terminal_t));
+    if (pcb->terminal == NULL)
     {
         queue_remove_at(pcb->parent_task->child_pcb, pcb->child_index);
         free(pcb->cmdline);
@@ -2768,7 +2832,7 @@ pcb_t create_process_group_as(const char *name, pcb_t parent, page_directory_t *
         free(pcb);
         return NULL;
     }
-    memset(pcb->xtttp_stc, 0, sizeof(xtttp_dtt));
+    memset(pcb->terminal, 0, sizeof(x3tp_terminal_t));
 
     return pcb;
 }
@@ -2791,6 +2855,10 @@ void process_setup()
     pcb_group_queue     = queue_init();
     pcb_t kernel_pcb    = (pcb_t)calloc(1, sizeof(struct process_control_block));
     kernel_pcb->pid     = alloc_pid();
+    // The kernel pseudo-group is not a userspace session or process group:
+    // sid/pgid stay 0 so kill(-1)/job-control lookups never match it.
+    kernel_pcb->sid     = 0;
+    kernel_pcb->pgid    = 0;
     kernel_pcb->pagedir = get_kernel_pagedir();
     strcpy(kernel_pcb->name, "XSK System");
     kernel_pcb->parent_task  = kernel_pcb;
@@ -2798,7 +2866,7 @@ void process_setup()
     kernel_pcb->queue_index  = queue_enqueue(pcb_group_queue, kernel_pcb);
     kernel_pcb->thread_queue = queue_init();
     kernel_pcb->child_pcb    = queue_init();
-    kernel_pcb->xtttp_stc    = (xtttp_dtt *)calloc(1,sizeof(xtttp_dtt));
+    kernel_pcb->terminal    = (x3tp_terminal_t *)calloc(1,sizeof(x3tp_terminal_t));
     kernel_pcb->file_open    = queue_init();
     kernel_pcb->file_open_shared_refs = alloc_fd_table_ref();
     kernel_pcb->virt_queue   = queue_init();

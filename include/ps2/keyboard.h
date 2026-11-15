@@ -4,8 +4,6 @@
 
 #    include <proto.hpp>
 
-#define KB_BUF_SIZE 128
-
 #define MOUSE_BBIT 0x01
 #define MOUSE_ABIT 0x02
 
@@ -82,15 +80,11 @@ enum special_key_code
 
 struct keyboard_buf
 {
-    uint8_t *p_head;
-    uint8_t *p_tail;
-    int      count;
-    bool     ctrl;
-    bool     shift;
-    bool     alt;
-    bool     win;
-    bool     caps;
-    uint8_t  buf[KB_BUF_SIZE];
+    bool ctrl;
+    bool shift;
+    bool alt;
+    bool win;
+    bool caps;
 };
 
 bool wait_ps2_write();

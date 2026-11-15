@@ -101,6 +101,85 @@ static void dnsfs_format_ipv6_text(const uint8_t addr[16], char *buffer, size_t 
              (unsigned int)(((uint16_t)addr[14] << 8) | addr[15]));
 }
 
+/* Current /run/dns/server view in resolv.conf syntax, or an empty string when
+ * no server is configured (stable fallback for unavailable stacks). */
+static size_t dnsfs_server_text(char *buffer, size_t size)
+{
+    if (buffer == NULL || size == 0) {
+        return 0;
+    }
+    buffer[0] = '\0';
+
+    uint32_t dns_addr = 0;
+    if (socket_get_dns_server(&dns_addr) < 0) {
+        return 0;
+    }
+
+    char ip_text[64];
+    char resolv_conf[96];
+    dnsfs_format_ipv4_text(dns_addr, ip_text, sizeof(ip_text));
+    int length = snprintf(resolv_conf, sizeof(resolv_conf), "nameserver %s\n", ip_text);
+    if (length <= 0) {
+        return 0;
+    }
+
+    size_t copied = (size_t)length;
+    if (copied >= size) {
+        copied = size - 1;
+    }
+    memcpy(buffer, resolv_conf, copied);
+    buffer[copied] = '\0';
+    return copied;
+}
+
+/* Length of the current read() view for this file, so stat()/open can publish a
+ * regular-file size that matches what read() will return. */
+static size_t dnsfs_content_length(dnsfs_handle_t *handle)
+{
+    if (handle == NULL) {
+        return 0;
+    }
+
+    if (handle->kind == DNSFS_KIND_SERVER) {
+        char text[96];
+        return dnsfs_server_text(text, sizeof(text));
+    }
+
+    if (handle->kind == DNSFS_KIND_RESOLVE) {
+        spin_lock(&handle->lock);
+        size_t length = handle->length;
+        spin_unlock(&handle->lock);
+        if (length > sizeof(handle->buffer)) {
+            length = sizeof(handle->buffer);
+        }
+        return length;
+    }
+
+    return 0;
+}
+
+/* Give the node a regular-file shape: type maps to S_IFREG, size is the
+ * current view length and DAC is root-owned. Re-run on every access because
+ * file_none nodes go through the stat callback, which keeps the reported size
+ * in sync with the live resolver state. */
+static void dnsfs_apply_attrs(vfs_node_t node, dnsfs_handle_t *handle)
+{
+    node->fsid  = dnsfs_id;
+    node->owner = 0;
+    node->group = 0;
+
+    if (handle->kind == DNSFS_KIND_ROOT) {
+        node->type = file_dir;
+        node->size = 0;
+        vfs_node_set_mode(node, 0755);
+        return;
+    }
+
+    node->type = file_none;
+    node->size = dnsfs_content_length(handle);
+    vfs_node_set_mode(node, 0644);
+}
+
 static size_t dnsfs_copy_text_out(const char *text, size_t text_len, void *addr, size_t offset, size_t size)
 {
     if (offset >= text_len) {
@@ -192,27 +271,23 @@ static int dnsfs_parse_resolve_request(char *buffer, int *out_family, char **out
     return 0;
 }
 
-static errno_t dnsfs_mount(const char *handle, vfs_node_t node)
+static errno_t dnsfs_mount(const char *src, vfs_node_t node)
 {
-    if ((uint64_t)handle != DNS_REGISTER_ID) {
-        return VFS_STATUS_FAILED;
-    }
+    /* vfs_mount_virtual() already selected this filesystem by register ID. */
+    (void)src;
 
-    node->fsid   = dnsfs_id;
-    node->type   = file_dir;
     node->handle = &dnsfs_root_handle;
     dnsfs_root   = node;
+    dnsfs_apply_attrs(node, &dnsfs_root_handle);
 
     vfs_node_t resolve_node = vfs_child_append(node, "resolve", &dnsfs_resolve_handle);
     if (resolve_node != NULL) {
-        resolve_node->type = file_stream;
-        resolve_node->size = (uint64_t)-1;
+        dnsfs_apply_attrs(resolve_node, &dnsfs_resolve_handle);
     }
 
     vfs_node_t server_node = vfs_child_append(node, "server", &dnsfs_server_handle);
     if (server_node != NULL) {
-        server_node->type = file_stream;
-        server_node->size = (uint64_t)-1;
+        dnsfs_apply_attrs(server_node, &dnsfs_server_handle);
     }
 
     return VFS_STATUS_SUCCESS;
@@ -223,19 +298,17 @@ static void dnsfs_open(void *parent, const char *name, vfs_node_t node)
     (void)parent;
     if (node == dnsfs_root) {
         node->handle = &dnsfs_root_handle;
-        node->type = file_dir;
-        node->size = 0;
+        dnsfs_apply_attrs(node, &dnsfs_root_handle);
     } else if (name != NULL && strcmp(name, "resolve") == 0) {
         node->handle = &dnsfs_resolve_handle;
-        node->type = file_stream;
-        node->size = (uint64_t)-1;
+        dnsfs_apply_attrs(node, &dnsfs_resolve_handle);
     } else if (name != NULL && strcmp(name, "server") == 0) {
         node->handle = &dnsfs_server_handle;
-        node->type = file_stream;
-        node->size = (uint64_t)-1;
+        dnsfs_apply_attrs(node, &dnsfs_server_handle);
     } else {
-        node->type = file_stream;
-        node->size = (uint64_t)-1;
+        node->type = file_none;
+        node->size = 0;
+        vfs_node_set_mode(node, 0644);
     }
 }
 
@@ -246,14 +319,7 @@ static errno_t dnsfs_stat(void *file, vfs_node_t node)
         return VFS_STATUS_FAILED;
     }
 
-    node->fsid = dnsfs_id;
-    if (handle->kind == DNSFS_KIND_ROOT) {
-        node->type = file_dir;
-        node->size = 0;
-    } else {
-        node->type = file_stream;
-        node->size = (uint64_t)-1;
-    }
+    dnsfs_apply_attrs(node, handle);
     return EOK;
 }
 
@@ -265,16 +331,9 @@ static size_t dnsfs_read(void *file, void *addr, size_t offset, size_t size)
     }
 
     if (handle->kind == DNSFS_KIND_SERVER) {
-        uint32_t dns_addr = 0;
-        if (socket_get_dns_server(&dns_addr) < 0) {
-            return 0;
-        }
-
-        char ip_text[64];
         char resolv_conf[96];
-        dnsfs_format_ipv4_text(dns_addr, ip_text, sizeof(ip_text));
-        snprintf(resolv_conf, sizeof(resolv_conf), "nameserver %s\n", ip_text);
-        return dnsfs_copy_text_out(resolv_conf, strlen(resolv_conf), addr, offset, size);
+        size_t text_len = dnsfs_server_text(resolv_conf, sizeof(resolv_conf));
+        return dnsfs_copy_text_out(resolv_conf, text_len, addr, offset, size);
     }
 
     spin_lock(&handle->lock);
@@ -402,6 +461,9 @@ static struct vfs_callback dnsfs_callbacks = {
 
 int dnsfs_setup(void)
 {
+    /* The resolver ABI is files: resolve/server under /run/dns. Reading or
+     * writing them is a normal open/read/write/stat access; do not add private
+     * ioctls or an out-of-band kernel control channel for DNS. */
     dnsfs_id = vfs_regist("dnsfs", &dnsfs_callbacks, DNS_REGISTER_ID, 0x444e5346);
 
     vfs_mkdir("/run");
@@ -410,7 +472,7 @@ int dnsfs_setup(void)
     if (dns_root == NULL) {
         return -ENOENT;
     }
-    if (vfs_mount((const char *)DNS_REGISTER_ID, dns_root) == VFS_STATUS_FAILED) {
+    if (vfs_mount_virtual(DNS_REGISTER_ID, dns_root) == VFS_STATUS_FAILED) {
         return -EIO;
     }
 

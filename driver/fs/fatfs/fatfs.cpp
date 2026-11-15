@@ -338,9 +338,11 @@ static void fatfs_apply_filinfo(vfs_node_t node, const FILINFO *fno) {
     node->createtime = ns;
     node->readtime   = ns;
     node->writetime  = ns;
-    // FAT 解析出的文件名统一经此出口通知内核态策略钩子（如 ime-kmod 的
-    // ime_vfs_resolved_name），用于给节点打保护标记。无钩子时是 no-op。
-    vfs_notify_resolved_name(node, fno->fname);
+    // FAT 没有 uid/gid/mode：统一按挂载默认属性 root:root，
+    // 目录 0755、文件 0644。ESP 因此只允许 Root/System 写入。
+    node->owner = 0;
+    node->group = 0;
+    vfs_node_set_mode(node, (fno->fattrib & AM_DIR) ? 0755 : 0644);
 }
 
 void fatfs_open(void *parent, const char *name, vfs_node_t node) {
@@ -488,16 +490,11 @@ errno_t fatfs_mount(const char *src, vfs_node_t node) {
     fatfs_lock();
     
     // if (node == rootdir) return -1; // 不支持fatfs作为rootfs
-    if (is_virtual_fs(src)) 
-    {   
-        fatfs_unlock();
-        return VFS_STATUS_FAILED;
-    }
-
     int drive                   = alloc_number();
     drive_number_mapping[drive] = vfs_open(src);
     if (drive_number_mapping[drive] == NULL) 
-    {   
+    {
+        write_serial_fmt("FATFS: mount open %s failed (drive=%d)\n", src, drive);
         fatfs_unlock();
         return VFS_STATUS_FAILED;
     }
@@ -506,6 +503,7 @@ errno_t fatfs_mount(const char *src, vfs_node_t node) {
     sprintf(path, "%d:", drive);
     FRESULT r = f_mount(&volume[drive], path, 1);
     if (r != FR_OK) {
+        write_serial_fmt("FATFS: f_mount %s drive=%d res=%d\n", src, drive, (int)r);
         vfs_close(drive_number_mapping[drive]);
         drive_number_mapping[drive] = NULL;
         free(path);
@@ -775,8 +773,9 @@ vfs_node_t fatfs_dup(vfs_node_t node) {
     copy->size        = node->size;
     copy->linkname    = node->linkname == NULL ? NULL : strdup(node->linkname);
     copy->flags       = node->flags;
-    copy->permissions = node->permissions;
+    vfs_node_set_mode(copy, vfs_node_mode(node));
     copy->owner       = node->owner;
+    copy->group       = node->group;
     copy->child       = node->child;
     copy->realsize    = node->realsize;
     copy->inode       = node->inode;
@@ -848,6 +847,6 @@ static struct vfs_callback fatfs_callbacks = {
 
 void fatfs_init() {
     mutex_create(&fatfs_operate_lock, true);
-    fatfs_id = vfs_regist("fatfs", &fatfs_callbacks, 0, 0x4d44);
+    fatfs_id = vfs_regist("fatfs", &fatfs_callbacks, VFS_DEVICE_REGISTER_ID, 0x4d44);
     if (fatfs_id == VFS_STATUS_FAILED) { write_serial_fmt("Failed to register fat filesystem\n"); }
 }

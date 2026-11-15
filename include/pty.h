@@ -17,7 +17,10 @@ typedef struct pty_handle {
     struct winsize      win;
     struct vt_mode      vt_mode;
     spin_t              lock;
-    int                 ctrl_pgid;
+    int                 ctrl_pgid;      // foreground process group (0 = unset)
+    int                 ctrl_sid;       // session that owns this as controlling tty (0 = none)
+    int                 ctrl_owner_pid; // process that attached it via TIOCSCTTY
+    bool                hup_sent;       // SIGHUP is delivered once when the master goes away
     int                 master_fds;
     int                 slave_fds;
     int                 tty_kbmode;
@@ -33,4 +36,8 @@ typedef struct pty_handle {
 } pty_handle_t;
 
 void pty_init();
+
+// Job-control helpers used by the syscall/procfs layers.
+void pty_detach_controlling(size_t sid, size_t owner_pid);
+int  pty_session_foreground_pgid(size_t sid);
 

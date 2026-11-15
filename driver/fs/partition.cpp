@@ -79,7 +79,7 @@ static void partition_try_automount(size_t partition_index)
     vfs_node_t mount_node = vfs_open(mount_path);
     if (mount_node == NULL || mount_node->is_mount) return;
 
-    if (vfs_mount(dev_path, mount_node) == EOK)
+    if (vfs_mount_device(dev_path, NULL, mount_node) == EOK)
     {
         pr_info("part: automount %s -> %s success\n", dev_path, mount_path);
     }
@@ -626,7 +626,7 @@ static bool root_probe_partition(const char *dev_path)
     if (probe == NULL) return false;
 
     bool found = false;
-    if (vfs_mount(dev_path, probe) == VFS_STATUS_SUCCESS)
+    if (vfs_mount_device(dev_path, NULL, probe) == VFS_STATUS_SUCCESS)
     {
         found = root_probe_has_system_markers(probe);
         vfs_unmount("/__root_probe");
@@ -659,7 +659,7 @@ static bool mount_partition_index(uint64_t index, const char *reason)
     write_serial_string(buf);
     write_serial_string("\n");
 
-    if (vfs_mount((const char *)buf, rootdir) == VFS_STATUS_SUCCESS)
+    if (vfs_mount_device(buf, NULL, rootdir) == VFS_STATUS_SUCCESS)
     {
         pr_info("Mount root OK: %s (%s)\n", buf, reason != NULL ? reason : "system markers");
         return true;
@@ -788,7 +788,7 @@ void mount_root()
             continue;
         }
 
-        if (vfs_mount((const char *)buf, rootdir) == VFS_STATUS_SUCCESS)
+        if (vfs_mount_device(buf, NULL, rootdir) == VFS_STATUS_SUCCESS)
         {
             pr_info("Mount root OK: %s\n", buf);
             return;

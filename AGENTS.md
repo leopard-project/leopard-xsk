@@ -76,11 +76,14 @@ Not present (by design): `boot/`, `kmod/`, `third_party/`, `user/` (top-level),
 | Task | Location | Notes |
 |------|----------|-------|
 | Kernel entry / boot sequence | `kernel/main.cpp` | `KernelMain`; CPU→memory→VFS→devices→SMP→syscalls→reaper→launch PID1. |
-| PID1 launch | `kernel/main.cpp` (tail) | Reads `BootConfig.init` (from boot.conf); fallback `/system/leopard/leopard-rc.elf`. No hardcoded shell path. |
-| Live-root / installer root | `kernel/installer_mode.cpp` | Unpacks XJPAK10 live root into tmpfs when `BOOT_FLAG_LIVE_ROOT`. |
-| VFS core | `driver/fs/vfs/vfs.cpp`, `include/fs/vfs/vfs.h` | Node callbacks, alias primitive, dispatch. |
+| PID1 launch | `kernel/main.cpp` (tail) | Parses `init=` from the variable `BOOT_CONFIG.cmdline`; fallback `/system/leopard/leopard-rc.elf`. No hardcoded shell path. |
+| Initrd / ramdisk | `kernel/initrd.cpp` | Unpacks the XJPAK10 initrd into tmpfs when `BOOT_FLAG_INITRD`; live/installer policy stays in user space. |
+| VFS core | `driver/fs/vfs/vfs.cpp`, `include/fs/vfs/vfs.h` | Node callbacks and dispatch only; no product/IME fields, resolved-name hooks, or path-alias table. `vfs_check_access` / `vfs_check_child_creation` are the permission primitives; `vfs_access_op_t` keeps 0..8 ABI plus 9 = `EXEC`. File DAC uses `vfs_node_mode()` / `vfs_node_set_mode()`; `vfs_chmod`/`vfs_chown` persist through the fs callback; `vfs_read_raw`/`vfs_write_raw`/`vfs_ioctl_raw` are fs-internal block I/O after mount authorization. |
+| Console / tty | `driver/tty/tty.cpp`, `include/tty.h` | `/dev/stdio`, `/dev/tty`, `/dev/null`, `/dev/urandom`, termios/ioctl translation; moved out of the VFS core. |
+| X3TP | `include/x3tp.h`, `kernel/x3tp.cpp` | Event core (per-source SPSC + `source -> seat -> endpoint` static route + IRQ fast path) plus the terminal view (`xapi_Getch`/`xapi_Input`/`SXAH_*`). `/dev/console` (registered in `driver/fs/vfs/dev.cpp`) is the seat0 endpoint read by conhost. No router thread, no global focus table, no data-path lock. |
 | FATFS port | `driver/fs/fatfs/` | FatFs + Unicode glue; largely upstream-derived. |
-| Pseudo-filesystems | `driver/fs/vfs/` (`dev.cpp` `procfs.cpp` `tmpfs.cpp` `pipefs.cpp` `pty.cpp` …) | |
+| Pseudo-filesystems | `driver/fs/vfs/` (`dev.cpp` `procfs.cpp` `tmpfs.cpp` `pipefs.cpp` `pty.cpp` …) | Generic VFS-backed pseudo filesystems. |
+| Network pseudo-FS | `driver/net/` (`nmfs.cpp` `dnsfs.cpp`) | `/run/NetworkManager/*` and `/run/dns/*`; regular files, `open/read/write/stat` only, no private ioctl/syscall control channel. |
 | Syscall dispatch | `kernel/syscall/syscall.cpp`, `sys.cpp`, `include/syscall/syscall.h` | ~264 `SYS_*` (Linux ABI) + XAPI. Three sites must stay in sync. |
 | Build graph | `tools/gen_ninja.py` | Regenerate with `python3 tools/gen_ninja.py`. |
 | Root mount | `driver/fs/partition.cpp` (`mount_root`) | Non-installer boot path. |
@@ -97,6 +100,109 @@ Not present (by design): `boot/`, `kmod/`, `third_party/`, `user/` (top-level),
 - Wiring a syscall: keep three signatures in sync — `sys.cpp` implementation,
   `include/syscall/syscall.h` declaration, `syscall.cpp` dispatch `case`.
 
+## OPTIONAL PERSONALITY MODULES + SYSCALL HOOKS（方案，未实现）
+
+> 状态：2026-11-15 设计记录，**未实现**。legacy 单槽
+> `OpenXJ380Socket_RegisterSyscallHook` 也就核内保留，但已从导出表移除；它原本只对
+> `switch` 未命中的 syscall 生效。没有版本化 personality/provider 注册 ABI。
+> GUI XAPI 的已知编号在 `kernel/syscall/syscall.cpp` 的 `switch` 中直接返回
+> `-ENOSYS`，所以 `graphics.sys` 不能通过现有 hook 接管。树内也不存在
+> `graphics.sys`，`kmod/` 只有 e1000/netserver/xhci 和 ime skeleton。
+> **不要为了某个模块往 `syscall.cpp` 里加私有 `case`。**
+
+### 目标架构
+
+```text
+基础系统（无 personality 模块）
+  Unix VFS + /run + 原生 socket + console/TTY
+  不内置 OJ 图形/网络策略；GUI XAPI 返回 -ENOSYS
+
+可选模块（安装后提供兼容 ABI）
+  graphics.sys   -> XAPI GUI personality
+  network-kmod   -> XAPI_NET(7503) personality + worker kthread
+
+用户态服务
+  leopard-networkd -> 唯一网络管理者，拥有 /run/NetworkManager/* 文件
+```
+
+- `graphics.sys`/`network-kmod` 是 optional personality，不是基础系统依赖。
+- `network-kmod` 是 OJ ABI adapter，不是第二个 NetworkManager；`leopard-networkd`
+  是唯一 writer。
+- 文件是稳定控制面 ABI；socket 数据面不得用“每包文件 RPC”实现。
+
+### 必须先实现的 syscall hook ABI
+
+在实现任何 personality 模块之前，内核需要先定义并实现：
+
+1. 版本化注册接口，例如：
+   ```c
+   int xapi_personality_register(uint32_t abi_version,
+                                 const xapi_personality_ops_t *ops,
+                                 size_t count);
+   ```
+   或等价的 `syscall_family_register()`。
+2. 固定分发顺序：内置 handler → personality handler → `-ENOSYS`。
+3. 安全的用户指针访问子集：`copy_from_user` / `copy_to_user` / range check；
+   绝不能把裸用户指针交给模块直接解引用。
+4. 凭证/权限语义：syscall 在调用者上下文执行时保留调用者身份；worker 异步执行时
+   必须显式携带/校验发起者身份。
+5. 结构体 `size/version/reserved` 校验、错误码约定、并发/生命周期规则。
+6. 注销/引用计数/模块卸载规则；`create_kernel_thread()` 创建的 worker 必须先停止，
+   或模块声明为不可卸载。
+7. 能力探测：例如 `xapi_NetGetCapabilities()` 返回 `backend_present`，用于
+   `leopard-networkd` 判断 module 是否存在，不增加私有 side channel。
+
+### 网络方案约束
+
+- `leopard-networkd` 拥有 `/run/NetworkManager/*`，是唯一配置 writer。
+- `network-kmod` 只做 OJ `XAPI_NET(7503)` 的 ABI 翻译：
+  - 可使用已导出的 `vfs_open/vfs_close/vfs_read/vfs_write`；
+  - 不导出/不调用 `socket_set_ipv4_config()`、`socket_get_netinfo()`、
+    `socket_resolve_ipv4()`、`socket_set_dns_server()`；
+  - 不自己挂载 VFS，不构造 `vfs_node`。
+- 控制面（capabilities/interface/config/DNS/resolve）可通过文件协议；
+- 数据面（`NetOpen/Bind/Connect/Send/Receive/WaitMany`）不能每包走文件：
+  - 要么只做控制面兼容，socket 调用返回 `-ENOSYS`；
+  - 要么走原生 socket provider / 共享内存环；
+  - 不要引入“内核 worker 写请求文件、用户态 daemon 回写响应”的每包往返。
+- module 不在：OJ ABI 返回 `-ENOSYS`；`leopard-networkd` 不在：返回 `-ENODEV`。
+- 二者都在：`leopard-networkd` 是唯一 writer，`network-kmod` 只做 adapter，避免冲突。
+
+### graphics.sys 约束
+
+- 无 `graphics.sys` 时：基础系统只有 Unix console/TTY，GUI XAPI 返回 `-ENOSYS`。
+- `graphics.sys` 若做成 kmod，仍在 ring 0；它提供 OJ GUI ABI 的同时会成为最大攻击面。
+- 必须满足：
+  - 显式安装/加载，安全模式可禁用；
+  - 模块签名/allowlist，`/mod` 或 `/system/mod` root-only；
+  - 不导出裸 VFS/socket/页表/`rootdir`；
+  - 优先考虑用户态 graphics server + 薄内核 shim，而不是完整 Win32k 式内核模块。
+
+### 当前限制 / 阻塞项
+
+1. **没有 syscall hook ABI**：`syscall.cpp` 固定 `switch`，无法把 `XAPI_*` 分发给模块。
+2. **没有 `graphics.sys`**：GUI XAPI case 只是硬编码 `-ENOSYS`。
+3. **没有安全 uaccess 导出**：模块无法安全处理用户缓冲区。
+4. **没有模块生命周期规则**：worker 线程与 `dlclose`/模块卸载没有 stop/join 协议。
+5. **导出策略**：VFS 当前只导出 5 个原语；personality 至少要新增 hook 注册
+   （可能还有 uaccess 子集），这是需要单独评审的例外，不能顺手恢复 `rootdir`、
+   `vfs_mkdir`、裸 socket 控制等导出。
+6. **OJ `XAPI_NET(7503)` 完整 ABI 尚未在 XSK 实现**：它包含 socket 句柄、worker、
+   WaitMany/cancel/timeout；文件 RPC 不足以覆盖数据面。
+7. **冲突检测 ABI 未实现**：没有 `backend_present`/capability 探测，networkd 与
+   kmod 的主从关系无法可靠确定。
+8. **模块安全未完成**：签名、allowlist、安全模式、模块路径保护都需要先落地。
+9. **没有 hook/personality 的 QEMU 回归**：当前无法验证 ABI 分发、拒绝路径和卸载。
+
+### 解锁后的实现顺序
+
+1. 定义并测试 syscall personality hook（含拒绝路径、版本不匹配、模块缺失）。
+2. 导出受控 uaccess 子集；补 personality ABI 的 `size/version/reserved` 校验。
+3. 补模块 worker 生命周期/停止协议（或声明不可卸载）。
+4. 实现 `leopard-networkd` 文件契约 + `network-kmod` 控制面 adapter。
+5. 再决定 OJ socket 数据面：原生 provider、共享内存环，或只做控制面。
+6. `graphics.sys` 最后做，且按高风险可选模块处理。
+
 ## CONVENTIONS
 
 - Freestanding: `-nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fno-rtti`
@@ -111,6 +217,8 @@ Not present (by design): `boot/`, `kmod/`, `third_party/`, `user/` (top-level),
 
 - Do not hardcode distro/application policy in the kernel (see RED LINE 1).
 - Do not add a syscall or VFS alias that encodes a specific filename or pathname.
+- Do not add per-module `case` branches to `kernel/syscall/syscall.cpp`; optional
+  personalities must go through the (future) syscall-hook ABI documented above.
 - Do not fix upstream OpenXJ380 bugs (see RED LINE 2); attribute first.
 - Do not dereference user pointers in filesystem/syscall paths without copying at the boundary.
 - Do not treat upstream-derived FATFS code as ordinary first-party cleanup territory.
@@ -139,28 +247,139 @@ Build env vars: `COMPILER_PREFIX`, `CC`, `CPP`, `NASM`, `LD`, `OBJC`,
 - **Colon filenames (FAT):** the correct primitive is VFAT driver-layer name normalization
   (illegal-char handling + LFN), modeled on Linux `fs/fat/namei_vfat.c` — not app-level
   alias registration. OpenXJ380's hardcoded xbps-key VFS alias is the anti-pattern.
-- **PID1 decoupled:** kernel reads `BootConfig.init` (boot.conf); no hardcoded shell path.
+- **PID1 decoupled:** kernel parses `init=` from the `BOOT_CONFIG.cmdline` tail (boot.conf); no hardcoded shell path.
 
 ---
 
-## 输入路由 + IME kmod 架构（C 方案，2026-10-28 定稿）
+## IME 第一次尝试的教训（2026-10-29，leopard-ime）
 
-精简内核只保留**输入原语 + 通用钩子 + 符号导出**；IME 业务（焦点匹配、事件队列、投递、
-会话、配置、词库）全部放进独立仓库 `ime-kmod`（可加载 `.sys`）。
+第一次 `leopard-ime` 尝试是用户态 daemon + 文件 IPC：
 
-### 输入原语（内核保留）
-- sink 注册表 + 焦点表：`include/input_sink.h`、`kernel/input_sink.cpp`。
-- 输入流拦截器：`input_route_set_interceptor` / `input_route_interceptor`，签名
-  `bool (*)(uint64_t msg_type, uint64_t lData, uint64_t callback, tcb_t task)`。
-- 路由/投递：`input_route_dispatch`、`do_message`、`do_message_unfiltered`、`message_getch_try`。
+```text
+leopard-ime <- request/response 文件
+  COMPOSE <拼音> -> OK <候选...>
+  PING -> PONG
+lpsh: xapi_Getch/XAPI_INPUT -> COMPOSE -> SXAH_WRITE_INPUT_BUFFER
+```
+
+它被暂缓，不是“不需要 IME”，而是当时的闭环不成立。教训：
+
+1. **不要先做 IME，后补输入/终端原语。**
+   必须先有稳定的 console input、PTY/fd stdio、focus/context、commit 路径。
+2. **不要把 `XAPI_IME_*` 7474-7485 syscall ABI 当作新 IME 的基础。**
+   它是 OpenXJ380 内核 IME 的产物，运行时绑 WinMpf/GUI 焦点；
+   XSK 没有 GUI 时只能对齐接口层，无法形成运行时闭环。
+3. **文件 IPC 的 `COMPOSE/PING` 不够。**
+   IME 需要 focus、caret、password、preedit、candidate、engine
+   attach/detach、timeout、fail-open、user store；状态机式 request/response
+   不能覆盖。
+4. **Manager 和 Engine 必须分层。**
+   Manager 负责 registry/focus/context/event/UI/user store；
+   Engine 负责转换逻辑。mono-session 可以先同进程，但内部边界不能省。
+5. **IME 不应直接拿 XTTTP 缓冲当主输入。**
+   先用 `/dev/console` / PTY / fd stdio；XTTTP 只做 legacy 兼容。
+6. **IME 业务不进内核。**
+   内核只做输入路由、focus/context 传递、commit text；候选/词库/配置在用户态。
+7. **候选 UI 分阶段。**
+   终端/fb 候选列表先做；窗口候选等 `graphics.sys`。
+8. **不要记录按键内容。**
+   IME/daemon 能看到所有按键，日志必须脱敏；engine 身份要校验。
+
+当前决策（2026-11-15）：
+
+```text
+X3TP（IRQ 路由 + per-source SPSC + seat/endpoint + terminal view）
+  -> /dev/console + conhost
+  -> PTY/fd stdio
+  -> leopard-ime manager/engine（终端 IME）
+  -> graphics.sys 后再做 GUI IME/候选窗口
+```
+
+详见 `../leopard-ime/AGENTS.md`。
+
+---
+
+## X3TP（内核输入/终端标准，2026-11-16）
+
+> X3TP 取代旧的 input router / XTTTP getch 方案，不保留版本号。它包含
+> **event core**（source/seat/endpoint、/dev/console）和 **terminal view**
+> （xapi_Getch/xapi_Input/SXAH 的字节/行/输出视图）。没有 router 线程、没有
+> 全局焦点表，数据路径没有 mutex/spinlock，输入导出仍全部撤掉。
+
+### 数据流
+
+```text
+PS/2 IRQ ─┐
+USB worker ─┼─> input_route_irq(source, event) ─> source SPSC ring
+VKBD write ─┘        └─ 静态路由表 source -> seat -> endpoint
+                            └─ /dev/console（seat0/endpoint0，conhost 读取）
+```
+
+- `include/x3tp.h`：`x3tp_event_t` / `x3tp_source_t` / `x3tp_seat_t` /
+  `x3tp_endpoint_t` / `x3tp_route_t`；`static_assert(sizeof(x3tp_event_t) == 24)`。
+- `kernel/x3tp.cpp`：静态池 `8 seats / 8 endpoints / 3 sources`；
+  per-source SPSC（256 事件，head/tail 分 cache line）；IRQ 快路径为
+  `x3tp_route_irq()` —— 查表、写槽、release 发布 head、仅在
+  `notify 0 -> 1` 时调用 endpoint wake hook。队列满即丢弃并计数。
+- `x3tp_init()` 在 `kernel/main.cpp` 早期调用；`x3tp_console_device_init()` 在
+  `stdio_init()` / `vkbd_init()` 之后。
+- 多 seat 只是“加表项 + `x3tp_route_bind()`”，`x3tp_route_irq()` 不变。
+
+### `/dev/console` ABI
+
+- `driver/fs/vfs/dev.cpp` 注册 `DEVICE_STREAM`，read/poll 接到 input core。
+- `read()` 只返回完整 24 字节记录；空返回 `-EAGAIN`；缓冲区 `<24` 返回 `-EINVAL`。
+- `poll` 对“seat0 任一 ring 非空”返回 `POLLIN`（level-triggered），endpoint
+  closed 返回 `EPOLLHUP`。
+- 权限 `root:Admin 0660`（conhost 是 Admin；Visitor 拒绝）。
+- v1 无 write/ioctl：commit text 由 conhost 写 PTY，不写输入端点。
+- 记录布局：`type@0`、`value@4`、`flags@8`、`reserved@12`、`sequence@16`；
+  `CHAR=1` / `KEYDOWN=2` / `KEYUP=3`；CHAR 的 `value` 是 `ime_utf8_pack` 的 UTF-8。
+
+### source 行为
+
+- PS/2：`<128` 的按下字节发 `CHAR`（可打印 + 控制），`>=128` 的 `KEY_*`
+  发 `KEYDOWN`/`KEYUP`；可打印键的 key-up 不发（CHAR 是 commit-only）。
+- USB：同样 CHAR/KEY 拆分，source 为 `INPUT_SOURCE_USB`。
+- `/dev/vkbd`：每个 UTF-8 标量一个 `CHAR`，`value = ime_utf8_pack()`；
+  写入方加锁以满足“一 source 一 producer”；`/dev/vkbd` 默认 `root:root 0600`。
+
+### 已删除 / 保留
+
+- 删除：`input_router_init()` 与 router 线程、`g_router_lock`、`g_focus_id` 与焦点表、
+  `input_route_dispatch*`、`input_route_set_interceptor`、
+  `input_sink_push_focused`、`input_sink_focus`、旧 `INPUT_SOURCE_IME`。
+- 删除独立 `input_sink` / `xtttp_dtt`：字节环、行缓冲、输出缓冲合并为
+  `x3tp_terminal_t` + `x3tp_terminal_view_t`，由 X3TP 拥有。没有 sink 注册表、
+  没有全局 focus、没有 `message_getch_try`。
+- `SXAH_MARK_IS_TERMINAL` 只设置 legacy `is_shell`，不再注册/切换任何输入焦点。
+- 保留：per-terminal `x3tp_terminal_t`、`SXAH_*`、`xapi_Getch` / `xapi_Input` /
+  `/dev/stdio` 的行输入。它们都通过 X3TP 实现：
+  `get_keyboard_input()` 读当前终端（或默认）`x3tp_terminal_view_t`，
+  `x3tp_terminal_getch()` 在字节环为空时从 seat0 的 `CHAR` 事件 drain。
+- 键盘驱动不再维护 `kb_fifo` / `kb_synth` 第二条字节流；PS/2、USB、VKBD 都只
+  进入 X3TP。USB auto-repeat 通过 `keyboard_dispatch_key_message()` 重新
+  注入 X3TP。
+- 与 `/dev/console` 同时读仍会竞争同一 seat0 ring，是过渡期兼容行为。
 - 消息常量：`MSG_CHAR`/`MSG_KEYDOWN`/`MSG_KEYUP`/`MSG_SPCHAR`/`MSG_KEYLONGPRESS`（`include/syscall/pxapi.h`）。
 
-### VFS 通用保护/解析钩子（内核保留）
-- 枚举 `vfs_access_op_t`：`VFS_ACCESS_READ/WRITE/REMOVE/MOUNT`（`include/fs/vfs/vfs.h`）。
-- 钩子类型 `vfs_access_hook_t` / `vfs_resolved_name_hook_t`；注册 `vfs_set_access_hook` /
-  `vfs_set_resolved_name_hook`（均已导出）。
-- 内核内部调用点：`vfs_access_allowed` / `vfs_notify_resolved_name`（无钩子时放行/no-op）。
-- `vfs_node.ime_protection` 字段 = 内核态对象策略标记，由 resolved-name 钩子设置。
+### 用户态 socket 约束（上游 unix_poll）
+- `driver/fs/vfs/unixsock.cpp` 的 `unix_poll()` 先锁本端再锁 peer（与 OpenXJ380
+  相同）；两个进程同时 poll 同一连接两端会 ABBA 死锁，且发生在关中断 spinlock
+  内，表现为整机卡死、键盘 IRQ 停摆。
+- 不要在核内“修”上游 bug。用户态 socket 协议必须**一端 poll、另一端
+  `read`**，且避免双端同时 poll。详见 `docs/INPUT_ROUTING.md`。
+- **leopard-ime 已改用 pipe**（launcher 创建 stdin/stdout 管道对）：pipefs 有
+  真正的等待队列，poll 只锁 pipe、不锁 peer，是树内最快的阻塞 IPC；没有命名
+  socket/bind/connect。新的 session 服务优先复用 pipe 约定。
+
+### VFS 通用保护/访问钩子（内核保留）
+- 枚举 `vfs_access_op_t`：`VFS_ACCESS_READ/WRITE/REMOVE/MOUNT/.../EXPORT/EXEC`
+  （`include/fs/vfs/vfs.h`）。
+- 钩子类型 `vfs_access_hook_t`；`vfs_add_access_hook` 追加进钩子链（导出），
+  `vfs_set_access_hook` 仅保留为内核内兼容单槽 API，不再导出。
+- 内核内部判定：`vfs_access_allowed` / `vfs_check_access` / `vfs_check_child_creation`
+  （无钩子时放行）。
 
 ### pcb/tcb 精简
 - 已移除 IME 字段：`ime_role`、`ime_launch_generation`、`ime_config_depth`、
@@ -168,24 +387,71 @@ Build env vars: `COMPILER_PREFIX`, `CC`, `CPP`, `NASM`, `LD`, `OBJC`,
   （见 `ime-kmod/AGENTS.md`）。
 
 ### 符号导出（EXPORT_SYMBOL / _OBJECT / _F）
-- 已导出：vfs 原语、mutex 原语（含 `mutex_lock_recoverable`）、alloc 原语
-  （`malloc/free/calloc/realloc/aligned_alloc` 经 `__wrap_*`）、user 原语
-  （`current_user`/`rootdir` 对象、`user_session_is_ready`）、`xapi_json_*`、
-  page-table 原语（`translate_address`/`page_table_get_flags`/`lazy_tryalloc`）、
-  `vfs_set_access_hook`/`vfs_set_resolved_name_hook`。
+导出的都是原语，按用途分组（完整名单以 `grep -rn EXPORT_SYMBOL kernel/ driver/ lib/` 为准）：
+
+- **VFS**：`vfs_open` / `vfs_close` / `vfs_read` / `vfs_write` / `vfs_add_access_hook`。
+- **alloc**：`malloc` / `free` / `calloc` / `realloc` / `aligned_alloc`（模块引用经
+  `__wrap_*` 落到 IRQ 安全实现）、`alloc_frames` / `free_frames`、
+  `alloc_frames_dma32` / `free_frames_dma32`。
+- **string/libc**：`memset` / `memcpy` / `memcmp` / `memchr`、`strlen` / `strnlen` /
+  `strcpy` / `strncpy` / `strcat` / `strcmp` / `strncmp` / `strchr` / `strrchr` /
+  `strstr` / `strdup`、`atoi` / `strtol` / `isspace` / `isdigit` / `cmd_parse_limit`。
+- **console/log**：`printk`、`pr_debug` / `pr_info` / `pr_warn` / `pr_notice`、
+  `sprintf` / `snprintf`、`write_serial_fmt` / `write_serial_string`。
+- **task/sched**：`get_current_task`、`scheduler_yield` / `scheduler_sleep_ns` /
+  `scheduler_wake_task`、`create_kernel_thread`、`delay_ms_hp`、`nanoTime` /
+  `bootNanoTime`、mutex 原语（含 `mutex_lock_recoverable` /
+  `mutex_abort_for_process`）。
+- **memory/paging**：`phys_to_virt` / `virt_to_phys`、`driver_phys_to_virt` /
+  `driver_virt_to_phys`、`page_map_to` / `page_map_range` / `page_map_range_to` /
+  `page_map_range_to_random`、`page_virt_to_phys`、`get_current_directory`、
+  `translate_address` / `page_table_get_flags` / `lazy_tryalloc`（IME/外部模块
+  page-table 原语，保留）。
+- **net/socket**：`regist_netdev` / `get_default_netdev` / `netdev_send` /
+  `netdev_recv`、`socket_provider_register`。
+- **device/pci**：`regist_device` / `delete_device`、`pci_find_class` /
+  `pci_find_class_n`、`partition_device_added`。
+- **input driver ABI**：仅保留驱动注入所需的 `keyboard_usb_key_event` /
+  `mouse_inject_report`（xhci 使用）。`x3tp_route_*`、`x3tp_terminal_*`、
+  `keyboard_push_input`、`OpenXJ380Socket_*` 均已从导出表移除；输入路由与 legacy
+  终端输入是内核内部原语，模块 ABI 待 X3TP/PTY 与 network-kmod 一起定稿。
+- **user/session**：`current_user`（`_OBJECT`）、`user_session_is_ready`
+  （IME 相邻 ABI，待外部确认前保留）。
+- **xapi_json**：`xapi_parseJson` / `xapi_freeJsonValue` / `xapi_freeJsonDocument` /
+  `xapi_jsonObjectGet` / `xapi_jsonArraySize` / `xapi_jsonArrayAt`（定义在 `lib/`）。
+
+已移除导出：`create_user_process_from_file` —— 仅内核内部（PID1/runfile）使用，
+无树内模块或文档承诺该进程创建 ABI；模块启动进程应走 syscall/RUN 路径。
+同时清理了 `driver/pci/pci.cpp` 中与 `kernel/memory/heap.cpp` 重复的
+`malloc` / `free` 导出：两者原先指向同一 `__wrap_*` 地址，保留单一来源即可。
+**移除导出后模块必须重新构建**：`.sys` 在加载时解析符号，仍引用已移除导出的模块
+会以 unresolved-symbol 失败；改内核导出表后请 `ninja kmods` 并用
+`nm -u out/kmod/*.sys` 复核。
+
+- VFS 导出保持最小集合：`vfs_open` / `vfs_close` / `vfs_read` / `vfs_write` /
+  `vfs_add_access_hook`。`rootdir`（`_OBJECT` 暴露可写根指针）、`normalize_path`、
+  `vfs_set_access_hook`（可替换 DAC 钩子槽）以及创建/删除/截断原语
+  （`vfs_mkdir`/`vfs_mkfile`/`vfs_delete`/`vfs_resize`）均不导出。新增导出前必须
+  确认树内模块确实需要，并评估内核攻击面。
 - dlinker 用 `dlinker_mangled_global_matches` 把 kmod 的 C++ mangled 符号匹配到导出名。
 
-### LeopardOS console host（getty）
-- `keyboard_dispatch_key_message()` 把 `MSG_KEYDOWN` 的可打印/控制字节通过
-  `input_route_dispatch(MSG_CHAR, ...)` 投递到焦点 XTTTP sink；`XAPI_GETCH`
-  直接从 sink 读键。
-- `p_xapi_output_kernel()` 对“终端 owner 自己”的输出去 console/serial；子进程仍写入
-  `xtttp->output`，由 getty 的 console host 循环读取并渲染。
-- getty 只使用既有原语：`SXAH_MARK_IS_TERMINAL`、`SXAH_READ_OUTPUT_BUFFER`、
-  `SXAH_CHECK_INPUT_BUFFER`、`SXAH_WRITE_INPUT_BUFFER`、`SXAH_UNLOCK_OUTPUT_LOCK`、
-  `XAPI_GETCH`、`XAPI_PRINTF`。
-- `is_shell` 仍由 `SXAH_MARK_IS_TERMINAL` 设置；getty 负责终端循环，shell 不再直接 exec。
-- 屏幕尺寸通过 `/dev/tty` 的 `TIOCGWINSZ` 获取，不在内核新增尺寸原语。
+### 日志与显示边界
+- `write_serial_*` / `printk` / `pr_*` 只写串口，**不得再调用 `console_write()`**。
+  内核启动日志、`[busybox-debug]`、leopard-rc/mountd 等系统服务日志都留在串口。
+- framebuffer 只属于用户态 terminal host（conhost / compositor）；内核不再把日志
+  画到 fb，避免污染 VT。
+- installer/getty/shell 的业务输出走各自的 terminal view / PTY，由 conhost 渲染。
+
+### LeopardOS console host / getty
+- 启动链：`rc → conhost → getty → shell`。conhost 拥有 `/dev/console` 与
+  `/dev/fb0`，在 PTY 上启动 getty；getty 登录后 exec shell。
+- getty / OOBE 已改为 fd 0/1/2 + termios：使用 `read(0)` 和
+  `TCGETS/TCSETS` 的 `ECHO` 开关处理密码，不再使用 `XAPI_INPUT`。
+- conhost 从 `/dev/console` 读 `x3tp_event_t`，写 PTY；IME manager 以 pipe
+  连接。
+- `SXAH_*` / `xapi_Getch` / `xapi_Input` 只保留为 X3TP terminal view 的
+  兼容 API，供旧 XAPI 应用使用。
+- serial 只做内核/启动日志，不提供裸 TTY 登录路径。
 
 ### kmod 加载
 - 树内模块位于 `kmod/<name>/`，统一构建到 `out/kmod/<name>-kmod.sys`；`ninja kmods` 构建全部，

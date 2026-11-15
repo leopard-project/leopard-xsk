@@ -17,6 +17,7 @@ static uint32_t                 g_columns     = 0;
 static uint32_t                 g_rows        = 0;
 static uint8_t                  g_escape_state = 0;
 static spin_t                   g_console_lock = SPIN_INIT;
+static volatile bool             g_fb_suspended;
 
 static void put_pixel(uint32_t x, uint32_t y, uint32_t color)
 {
@@ -143,9 +144,14 @@ void console_write(const char *str)
     (void)str;
     return;
 #else
-    if (g_framebuffer == nullptr || str == nullptr) return;
+    if (g_framebuffer == nullptr || str == nullptr || g_fb_suspended) return;
     spin_lock(&g_console_lock);
     while (*str != '\0') put_character(*str++);
     spin_unlock(&g_console_lock);
 #endif
+}
+
+void console_suspend_fb()
+{
+    g_fb_suspended = true;
 }

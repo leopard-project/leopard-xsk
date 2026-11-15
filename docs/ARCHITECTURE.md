@@ -11,13 +11,13 @@ UEFI firmware
     -> kernel/KernelMain (out/kernel.krl)
     -> kernel core + built-in driver/
     -> VFS/root filesystem
-    -> launch PID1 (BootConfig.init，来自 boot.conf)
+    -> launch PID1 (cmdline 的 init=，来自 boot.conf)
     -> user-space ELF applications（用户态，本仓库之外）
 ```
 
 引导器在 OpenXSBoot 仓库；本仓库只负责固件交接后的一切：CPU/内存/设备/VFS/驱动/SMP/系统
-调用/进程，以及最后按 `BootConfig.init` 启动 PID1。live 环境下（`BOOT_FLAG_LIVE_ROOT`），
-`kernel/installer_mode.cpp` 把 XJPAK10 live root 解包进 tmpfs 当根文件系统。
+调用/进程，以及最后按 cmdline 的 `init=` 启动 PID1。initrd 环境下（`BOOT_FLAG_INITRD`），
+`kernel/initrd.cpp` 把 XJPAK10 initrd 解包进 tmpfs 当根文件系统；live/installer 的判定归用户态。
 
 ## 目录职责
 

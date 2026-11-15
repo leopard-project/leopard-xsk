@@ -10,7 +10,7 @@
 #include "stdint.h"
 #include "tty.h"
 #include "user/user.h"
-#include "user/x3tp.h"
+#include <x3tp.h>
 #include <mm/vma.h>
 #include <syscall/signal.h>
 
@@ -84,8 +84,10 @@ struct vfs_node;
 typedef struct vfs_node *vfs_node_t;
 struct process_control_block
 {
-    size_t   pid;  // 进程ID
+    size_t   pid;  // 进程ID (never reused as PGID/SID)
     uint64_t ppid; // 父进程ID
+    size_t   sid;  // 会话ID (session leader: sid == pid)
+    size_t   pgid; // 进程组ID (group leader: pgid == pid)
 
     char              name[32];     // 进程名称
     page_directory_t *pagedir;      // 页表目录
@@ -131,7 +133,7 @@ struct process_control_block
     uint64_t brk_current ;
 
     tty_t       *tty;
-    xtttp_dtt   *xtttp_stc;
+    x3tp_terminal_t   *terminal;
 
     int      notify_pcor_pipe_read_fd;
     int      notify_pcor_pipe_write_fd;
@@ -260,5 +262,6 @@ void kill_thread(tcb_t task);
 void kill_thread0(tcb_t task);
 void kill_proc0(pcb_t pcb);
 pcb_t found_pcb(int pid);
+pcb_t found_pgrp(int pgid);
 pcb_t found_process_by_exe_path(const char *exe_path);
 tcb_t found_thread(pcb_t pcb, int tid);

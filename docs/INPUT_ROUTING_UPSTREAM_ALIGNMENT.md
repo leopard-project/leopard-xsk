@@ -2,6 +2,11 @@
 
 > 依据：OpenXJ380 仓库（HEAD a1fcc2f）实际代码逐文件核对。
 > 目的：把之前「从零重构」的方向纠正为「参考/移植 OpenXJ380 已有内核态实现」。
+>
+> **2026-11-15 状态：本文仅保留为上游事实记录，不是 OpenXSKernel 的实施方向。**
+> XSK 已选择 Input Core v2（`source -> seat -> endpoint`，中断直接路由，
+> `/dev/console` 给用户态 conhost），不移植上游内核 IME（`input_method.cpp` /
+> `ime_config.cpp` / `ime_user_store.cpp`）。当前实现见 `INPUT_ROUTING.md`。
 
 ## 一句话结论
 

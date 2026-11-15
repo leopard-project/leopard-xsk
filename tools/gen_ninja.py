@@ -160,7 +160,7 @@ def main():
             desc = conf.get("description", f"OpenXSKernel module {name}")
             pkg_out = Path("out") / f"{pkgname}-{ver}.x86_64.xbps"
             stage = f".pkg-kmod-{name}"
-            args = f"-A x86_64 -n {pkgname}-{ver} -s '{desc}' -D 'OpenXSKernel>=2.1.0_1'"
+            args = f"-A x86_64 -n {pkgname}-{ver} -s '{desc}' -D 'OpenXSKernel>=2.2.0_2'"
             cmd = (f"rm -rf {stage} && mkdir -p {stage}/mod && cp {esc(target)} {stage}/mod/{name}-kmod.sys && "
                    f"cd out && xbps-create --compression gzip {args} ../{stage}")
             L += [f"rule package_kmod_{name}", f"  command = {cmd}", ""]
@@ -172,9 +172,10 @@ def main():
     L += ["build pack-kmods: phony " + " ".join(esc(x) for x in all_mod_pkgs), ""]
 
     # ---- xbps 打包（pack）----
-    pkg = {"name": "OpenXSKernel", "ver": "2.1.1_2", "arch": "x86_64",
+    pkg = {"name": "OpenXSKernel", "ver": "2.2.0_2", "arch": "x86_64",
            "desc": "Leopard kernel", "install": "system/kernel.krl"}
-    pkg_args = f"-A {pkg['arch']} -n {pkg['name']}-{pkg['ver']} -s '{pkg['desc']}'"
+    pkg_args = (f"-A {pkg['arch']} -n {pkg['name']}-{pkg['ver']} -s '{pkg['desc']}' "
+                f"-D 'OpenXSBoot>=2.1.1_2'")
     xbps_out = f"out/{pkg['name']}-{pkg['ver']}.{pkg['arch']}.xbps"
     L += [
         "rule package",

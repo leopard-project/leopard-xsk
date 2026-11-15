@@ -12,8 +12,6 @@ typedef enum
     DEVICE_STREAM,
     DEVICE_FB,
 } device_flag_t;
-typedef size_t (*read_vbuff)(int drive, struct vecbuf *buffer, size_t number, size_t lba);
-typedef size_t (*write_vbuff)(int drive, struct vecbuf *buffer, size_t number, size_t lba);
 typedef size_t (*readf)(int drive, uint8_t *buffer, size_t number, size_t lba);
 typedef size_t (*writef)(int drive, uint8_t *buffer, size_t number, size_t lba);
 typedef int (*ioctlf)(struct _device *device, size_t req, void *handle);

@@ -4,6 +4,10 @@
 > 终点：`a1fcc2f`（2026-10-26），即 XACT 2026v5 对应的源码树
 > 范围：7 个非 merge 提交，37 个文件
 > 原则：内核只收原语；IME/产品策略归 `ime-kmod` 或用户态仓库
+>
+> **2026-11-15 状态**：文中提到的 `input_route_dispatch` / `input_sink` 路由方案
+> 已被 Input Core v2 取代（`input_core.h`，`source -> seat -> endpoint`，
+> `/dev/console`）。相关段落只作为当时与上游合并的冲突记录，不再代表当前架构。
 
 ## 一、提交清单与归属
 
@@ -56,10 +60,10 @@
 
 上游在 IME 提交里把访问控制硬编码成 `ime_vfs_access()`，本仓库已泛化为：
 
-- `vfs_access_hook_t` / `vfs_resolved_name_hook_t`（`include/fs/vfs/vfs.h`）
-- `vfs_access_allowed()` / `vfs_notify_resolved_name()`（`driver/fs/vfs/vfs.cpp`）
+- `vfs_access_hook_t`（`include/fs/vfs/vfs.h`）
+- `vfs_access_allowed()`（`driver/fs/vfs/vfs.cpp`）
 - 调用点与上游一一对齐：`mkdir/link/symlink/mkfile/delete/rename/resize/open/open_no_follow/map/mount/read/write/write_fast/ioctl/unmount`，以及 `sys_rename/renameat/pivot_root`
-- `vfs_node.ime_protection` 字段保留为“内核态对象策略标记”
+- IME 专用的 `vfs_resolved_name_hook_t`、`vfs_notify_resolved_name()`、`vfs_node.ime_protection` 及 `vfs_register_alias()` 已从 VFS 删除；IME 策略应留在 kmod 自己的 per-task 侧表
 - 可恢复互斥 `mutex_lock_recoverable()` / `mutex_abort_for_process()`（`6876001` 已移植）
 - `ime_utf8_scalar_bytes()`（`include/ime_utf8.h`）已存在且与上游一致
 

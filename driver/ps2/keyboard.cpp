@@ -1,18 +1,14 @@
 #include <proto.hpp>
-#include <atom_queue.h>
 #include <dlinker.h>
+#include <x3tp.h>
 #include <openxj380/config.h>
 #include <openxj380/socket.h>
 #include <syscall/syscall.h>
 #include <syscall/pxapi.h>
 
 struct keyboard_buf kb_fifo;
-static atom_queue kb_fifo_queue;
 static volatile bool kb_fifo_ready = false;
-static uint8_t kb_synth_buf[KB_BUF_SIZE];
-static uint8_t *kb_synth_head = kb_synth_buf;
-static uint8_t *kb_synth_tail = kb_synth_buf;
-static volatile uint32_t kb_synth_lock = 0;
+static volatile uint32_t kb_repeat_lock = 0;
 static bool kb_e0_prefix = false;
 static uint8_t kb_ps2_pressed_values[2][128];
 static uint8_t kb_usb_pressed_values[256];
@@ -30,7 +26,7 @@ static void keyboard_emit_socket(void *regs_ptr, uint64_t error_code, uint8_t ra
     OpenXJ380KeyboardInterruptInfo event = {};
     event.regs = regs_ptr;
     event.error_code = error_code;
-    event.source = OPENXJ380_INPUT_SOURCE_PS2;
+    event.source = OPENXJ380_X3TP_SOURCE_PS2;
     event.raw_scancode = raw_scancode;
     event.make_code = make_code;
     event.value = value;
@@ -68,18 +64,21 @@ struct keyboard_usb_repeat_slot
 
 static keyboard_usb_repeat_slot kb_usb_repeat[KB_USB_REPEAT_SLOTS];
 
-static void kb_synth_lock_acquire()
+static void kb_repeat_lock_acquire()
 {
-    while (__sync_lock_test_and_set(&kb_synth_lock, 1) != 0)
+    while (__sync_lock_test_and_set(&kb_repeat_lock, 1) != 0)
     {
-        while (kb_synth_lock != 0) { __asm__ volatile("pause"); }
+        while (kb_repeat_lock != 0) { __asm__ volatile("pause"); }
     }
 }
 
-static void kb_synth_lock_release()
+static void kb_repeat_lock_release()
 {
-    __sync_lock_release(&kb_synth_lock);
+    __sync_lock_release(&kb_repeat_lock);
 }
+
+/* Defined later; used by the repeat service to inject into Input Core. */
+extern "C" void keyboard_dispatch_key_message(uint32_t source, uint64_t msg_type, uint8_t value);
 
 static bool kb_value_repeatable(uint8_t value)
 {
@@ -146,64 +145,19 @@ static uint8_t keyboard_dvorak_value(uint8_t make_code, bool shifted)
     }
 }
 
-static void kb_synth_enqueue_locked(uint8_t value)
-{
-    if (value == 0) return;
-
-    uint8_t *next = kb_synth_head + 1;
-    if (next == kb_synth_buf + KB_BUF_SIZE) { next = kb_synth_buf; }
-
-    if (next == kb_synth_tail) { return; }
-
-    *kb_synth_head = value;
-    kb_synth_head  = next;
-}
-
 static void keyboard_prepare_fifo()
 {
     if (kb_fifo_ready) return;
 
-    kb_fifo.p_head = kb_fifo.buf;
-    kb_fifo.p_tail = kb_fifo.buf;
-    kb_fifo.count  = 0;
     kb_fifo.ctrl   = false;
     kb_fifo.shift  = false;
     kb_fifo.alt    = false;
     kb_fifo.win    = false;
     kb_fifo.caps   = false;
-    memset(kb_fifo.buf, 0, KB_BUF_SIZE);
-    init_atom_queue(&kb_fifo_queue, kb_fifo.buf, KB_BUF_SIZE);
-    kb_synth_head  = kb_synth_buf;
-    kb_synth_tail  = kb_synth_buf;
-    memset(kb_synth_buf, 0, sizeof(kb_synth_buf));
     memset(kb_ps2_pressed_values, 0, sizeof(kb_ps2_pressed_values));
     memset(kb_usb_pressed_values, 0, sizeof(kb_usb_pressed_values));
     memset(kb_usb_repeat, 0, sizeof(kb_usb_repeat));
     kb_fifo_ready = true;
-}
-
-static void kb_synth_enqueue(uint8_t value)
-{
-    kb_synth_lock_acquire();
-    kb_synth_enqueue_locked(value);
-    kb_synth_lock_release();
-}
-
-static uint8_t kb_synth_dequeue()
-{
-    uint8_t value = 0;
-
-    kb_synth_lock_acquire();
-    if (kb_synth_tail != kb_synth_head)
-    {
-        value = *kb_synth_tail;
-        kb_synth_tail++;
-        if (kb_synth_tail == kb_synth_buf + KB_BUF_SIZE) {
-            kb_synth_tail = kb_synth_buf;
-        }
-    }
-    kb_synth_lock_release();
-    return value;
 }
 
 static void kb_usb_repeat_service()
@@ -211,18 +165,18 @@ static void kb_usb_repeat_service()
     uint64_t now = nanoTime();
     if (now == 0) return;
 
-    kb_synth_lock_acquire();
+    kb_repeat_lock_acquire();
     for (size_t i = 0; i < KB_USB_REPEAT_SLOTS; ++i)
     {
         keyboard_usb_repeat_slot *slot = &kb_usb_repeat[i];
         if (!slot->active || now < slot->next_repeat_ns) { continue; }
 
-        kb_synth_enqueue_locked(slot->value);
+        keyboard_dispatch_key_message(X3TP_SOURCE_USB, MSG_KEYDOWN, slot->value);
         uint64_t rate = __atomic_load_n(&kb_repeat_rate_hz, __ATOMIC_RELAXED);
         if (rate == 0) rate = 1;
         slot->next_repeat_ns = now + 1000000000ULL / rate;
     }
-    kb_synth_lock_release();
+    kb_repeat_lock_release();
 }
 
 static uint8_t keyboard_translate_base_make_code(uint8_t make_code, bool shift,
@@ -289,15 +243,48 @@ uint8_t keyboard_translate_event_value(uint8_t make_code, bool extended,
     return keyboard_translate_base_make_code(make_code, shift, caps);
 }
 
-extern "C" void keyboard_dispatch_key_message(uint64_t msg_type, uint8_t value)
+static uint32_t keyboard_input_flags(void)
+{
+    uint32_t flags = 0;
+    if (kb_fifo.shift) flags |= X3TP_FLAG_SHIFT;
+    if (kb_fifo.ctrl) flags |= X3TP_FLAG_CTRL;
+    if (kb_fifo.alt) flags |= X3TP_FLAG_ALT;
+    if (kb_fifo.win) flags |= X3TP_FLAG_WIN;
+    if (kb_fifo.caps) flags |= X3TP_FLAG_CAPS;
+    return flags;
+}
+
+extern "C" void keyboard_dispatch_key_message(uint32_t source, uint64_t msg_type, uint8_t value)
 {
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
-    /* Feed printable/control bytes into the focused XTTTP sink.  Special
-     * keys (>=128) stay out of the byte stream until keypad encoding is
-     * defined; login/console input uses XAPI_INPUT's raw fallback. */
-    if (msg_type == MSG_KEYDOWN && value != 0 && value < 128)
-        input_route_dispatch(MSG_CHAR, 0, (uint64_t)value, NULL, NULL);
+    /* Input Core v2: printable/control bytes become CHAR events (the only
+     * thing a terminal needs to commit). Special keys (KEY_* >= 128) have a
+     * stable key code and are delivered as KEYDOWN/KEYUP so a seat consumer
+     * can implement cursor/editing semantics. Key-up for a printable byte is
+     * redundant: CHAR is commit-only. */
+    if (value == 0) return;
+
+    x3tp_event_t event = {};
+    event.flags = keyboard_input_flags();
+
+    if (msg_type == MSG_KEYDOWN && value < 128)
+    {
+        event.type  = X3TP_EVENT_CHAR;
+        event.value = value;
+    }
+    else if (value >= 128)
+    {
+        event.type  = (msg_type == MSG_KEYDOWN) ? X3TP_EVENT_KEYDOWN : X3TP_EVENT_KEYUP;
+        event.value = value;
+    }
+    else
+    {
+        return;
+    }
+
+    (void)x3tp_route_irq(source, &event);
 #else
+    (void)source;
     (void)msg_type;
     (void)value;
 #endif
@@ -347,7 +334,7 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
     OpenXJ380KeyboardInterruptInfo event = {};
     event.regs = regs_ptr;
     event.error_code = error_code;
-    event.source = OPENXJ380_INPUT_SOURCE_PS2;
+    event.source = OPENXJ380_X3TP_SOURCE_PS2;
     event.route = OPENXJ380_INPUT_ROUTE_XJ380_PS2_IRQ;
     if (!OpenXJ380Socket_KeyboardInterrupt(&event))
     {
@@ -406,6 +393,7 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
     }
 
     keyboard_dispatch_key_message(
+        X3TP_SOURCE_PS2,
         pressed ? MSG_KEYDOWN : MSG_KEYUP,
         event_value
     );
@@ -415,26 +403,6 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
     keyboard_emit_socket(regs_ptr, error_code, x, make_code, event_value, extended, pressed);
 
     kb_e0_prefix = false;
-
-    if (key_release)
-    {
-        send_eoi();
-        return;
-    }
-
-    uint8_t fifo_value = event_value;
-
-    if (fifo_value == 0)
-    {
-        send_eoi();
-        return;
-    }
-
-    if (!atom_push(&kb_fifo_queue, fifo_value))
-    {
-        atom_pop(&kb_fifo_queue);
-        atom_push(&kb_fifo_queue, fifo_value);
-    }
 
     send_eoi();
 #endif
@@ -448,14 +416,8 @@ uint8_t get_keyboard_input()
     keyboard_prepare_fifo();
     kb_usb_repeat_service();
 
-    uint8_t synthetic = kb_synth_dequeue();
-    if (synthetic != 0) {
-        return synthetic;
-    }
-
-    int raw_input = atom_pop(&kb_fifo_queue);
-    if (raw_input >= 0) { return (uint8_t)raw_input; }
-    return NULL;
+    int value = x3tp_terminal_getch(x3tp_terminal_current_view());
+    return value < 0 ? 0 : (uint8_t)value;
 #endif
 }
 
@@ -533,20 +495,11 @@ extern "C" uint64_t keyboard_get_long_press_ms()
     return __atomic_load_n(&kb_long_press_ms, __ATOMIC_RELAXED);
 }
 
-extern "C" void keyboard_push_input(uint8_t value)
-{
-#if OPENXJ380_INPUT_OUTPUT_DISABLED
-    (void)value;
-#else
-    kb_synth_enqueue(value);
-#endif
-}
-
 extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pressed)
 {
 #if OPENXJ380_INPUT_OUTPUT_DISABLED
     OpenXJ380KeyboardInterruptInfo event = {};
-    event.source = OPENXJ380_INPUT_SOURCE_USB;
+    event.source = OPENXJ380_X3TP_SOURCE_USB;
     event.route = OPENXJ380_INPUT_ROUTE_XJ380_USB;
     event.usb_usage = usage;
     event.value = value;
@@ -592,10 +545,10 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
         kb_usb_pressed_values[usage] = 0;
     }
 
-    keyboard_dispatch_key_message(key_pressed ? MSG_KEYDOWN : MSG_KEYUP, event_value);
+    keyboard_dispatch_key_message(X3TP_SOURCE_USB, key_pressed ? MSG_KEYDOWN : MSG_KEYUP, event_value);
 
     OpenXJ380KeyboardInterruptInfo event = {};
-    event.source = OPENXJ380_INPUT_SOURCE_USB;
+    event.source = OPENXJ380_X3TP_SOURCE_USB;
     event.usb_usage = usage;
     event.value = event_value;
     event.message_type = (uint8_t)(key_pressed ? MSG_KEYDOWN : MSG_KEYUP);
@@ -607,12 +560,11 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
     event.caps = kb_fifo.caps ? 1 : 0;
     OpenXJ380Socket_KeyboardInterrupt(&event);
 
-    kb_synth_lock_acquire();
+    kb_repeat_lock_acquire();
     keyboard_usb_repeat_slot *slot = &kb_usb_repeat[usage];
 
     if (key_pressed)
     {
-        kb_synth_enqueue_locked(event_value);
         if (kb_value_repeatable(event_value))
         {
             uint64_t now = nanoTime();
@@ -630,16 +582,10 @@ extern "C" void keyboard_usb_key_event(uint8_t usage, uint8_t value, uint8_t pre
     else
     {
         slot->active = false;
-        if (event_value == KEY_CTRL)
-        {
-            // Keep legacy terminal input behavior consistent with the PS/2 path.
-            kb_synth_enqueue_locked(0x9d);
-        }
     }
 
-    kb_synth_lock_release();
+    kb_repeat_lock_release();
 #endif
 }
 
-EXPORT_SYMBOL(keyboard_push_input);
 EXPORT_SYMBOL(keyboard_usb_key_event);

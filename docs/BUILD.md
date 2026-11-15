@@ -47,7 +47,7 @@ ninja clean   # 清理 out/、kernel/build_config.h、.pkg/
 
 本仓库不直接跑 QEMU；完整的 live ISO 组装与启动验证流程见 **LeopardOS 仓库**
 （`make_iso.sh` + QEMU）。内核被 OpenXSBoot 加载，PID1 由 `boot.conf` 的 `init=`
-指定，内核读 `BootConfig.init` 后启动。
+指定，内核解析 `BOOT_CONFIG.cmdline` 的 `init=` 后启动。
 
 ## 5. 常见问题
 

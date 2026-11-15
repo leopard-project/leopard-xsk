@@ -6,8 +6,8 @@
 #include "pci/mcfg.h"
 #include "proto.hpp"
 #include <dlinker.h>
-EXPORT_SYMBOL(malloc);
-EXPORT_SYMBOL(free);
+/* malloc/free are exported from kernel/memory/heap.cpp as the IRQ-safe
+   __wrap_* implementations; do not re-export them here. */
 struct
 {
     uint32_t classcode;

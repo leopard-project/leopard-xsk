@@ -169,18 +169,38 @@ int signal_send_process(pcb_t process, int sig)
 
 int signal_send_group(int pgid, int sig)
 {
-    if (pgid <= 0 || sig < MINSIG || sig > MAXSIG) return -EINVAL;
+    if (pgid <= 0 || sig < 0 || sig > MAXSIG) return -EINVAL;
     extern lock_queue *pcb_group_queue;
     if (pcb_group_queue == NULL) return -ESRCH;
 
-    // setpgid currently stores the group ID in pcb->pid. Match every member,
-    // keeping the process list pinned until its thread queue has been visited.
+    // Match the process-group ID, never the PID: sys_setpgid() changes pgid and
+    // PID identity must stay stable for wait/kill/procfs.
     int ret = -ESRCH;
     spin_lock(&pcb_group_queue->lock);
     queue_foreach(pcb_group_queue, node)
     {
         pcb_t process = (pcb_t)node->data;
-        if (process == NULL || process->pid != (size_t)pgid || process->status == DEATH ||
+        if (process == NULL || process->pgid != (size_t)pgid || process->status == DEATH ||
+            process->status == OUT || process->status == ZOMBIE)
+            continue;
+        if (signal_send_process(process, sig) == 0) ret = 0;
+    }
+    spin_unlock(&pcb_group_queue->lock);
+    return ret;
+}
+
+int signal_send_session(size_t sid, int sig)
+{
+    if (sid == 0 || sig < 0 || sig > MAXSIG) return -EINVAL;
+    extern lock_queue *pcb_group_queue;
+    if (pcb_group_queue == NULL) return -ESRCH;
+
+    int ret = -ESRCH;
+    spin_lock(&pcb_group_queue->lock);
+    queue_foreach(pcb_group_queue, node)
+    {
+        pcb_t process = (pcb_t)node->data;
+        if (process == NULL || process->sid != sid || process->status == DEATH ||
             process->status == OUT || process->status == ZOMBIE)
             continue;
         if (signal_send_process(process, sig) == 0) ret = 0;

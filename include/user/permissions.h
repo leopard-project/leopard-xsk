@@ -42,16 +42,19 @@ struct PermissionPrompt
     bool individual;
 };
 
-// Load permissions.conf and install the VFS decision hook. A missing file
-// leaves the policy disabled (allow all), matching the pre-model behaviour.
-void permissions_init(const char *config_path);
-void permissions_load_policy(const char *path);
+// Load permissions.conf and install the VFS decision hook. Returns false on a
+// missing, empty, truncated or invalid file; the hook is installed regardless
+// and denies application access while no policy is loaded (fail-closed).
+bool permissions_init(const char *config_path);
+bool permissions_load_policy(const char *path);
 const PermissionPolicy *permissions_policy();
 
 uint8_t permissions_grade_mask(UserType type);
 void permissions_session_publish(const UserInfo *info);
 void permissions_process_init(pcb_t process, pcb_t parent, ProcessCredentialSource source);
 void permissions_process_exec(pcb_t process);
+// Drop/change the current process credentials (login/getty transition).
+void permissions_process_switch_identity(pcb_t process, const UserInfo *identity);
 void permissions_thread_exit(tcb_t task);
 
 uint8_t permissions_current_mask();

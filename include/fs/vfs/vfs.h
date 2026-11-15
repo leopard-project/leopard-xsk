@@ -4,79 +4,9 @@ char *normalize_path(const char *path);
 #define VFS_STATUS_FAILED  (-1)
 #define VFS_STATUS_SUCCESS 0
 
-#define FBIOGET_VSCREENINFO 0x4600
-#define FBIOPUT_VSCREENINFO 0x4601
-#define FBIOGET_FSCREENINFO 0x4602
-#define FBIOGETCMAP         0x4604
-#define FBIOPUTCMAP         0x4605
-#define FBIOPAN_DISPLAY     0x4606
-
-
-
-#define F_DUPFD         0
-#define F_GETFD         1
-#define F_SETFD         2
-#define F_GETFL         3
-#define F_SETFL         4
-#define F_GETLK         5
-#define F_SETLK         6
-#define F_SETLKW        7
-#define F_SETOWN        8
-#define F_GETOWN        9
-#define F_SETSIG        10
-#define F_GETSIG        11
-#define F_DUPFD_CLOEXEC 1030
-#define FD_CLOEXEC      1
-
-#define SEEK_SET  0 /* Seek from beginning of file.  */
-#define SEEK_CUR  1 /* Seek from current position.  */
-#define SEEK_END  2 /* Seek from end of file.  */
-#define SEEK_DATA 3
-#define SEEK_HOLE 4
-
-#define FIOCLEX 0x5451
-
-#define DT_UNKNOWN 0
-#define DT_FIFO    1
-#define DT_CHR     2
-#define DT_DIR     4
-#define DT_BLK     6
-#define DT_REG     8
-#define DT_LNK     10
-#define DT_SOCK    12
-#define DT_WHT     14
-
-#define AT_FDCWD (-100)
-#define AT_SYMLINK_NOFOLLOW 0x100
-#define AT_EMPTY_PATH 0x1000
-
-#define UTIME_NOW  ((1L << 30) - 1L)
-#define UTIME_OMIT ((1L << 30) - 2L)
-
-#define O_RDONLY    0
-#define O_WRONLY    1
-#define O_RDWR      2
-#define O_ACCMODE   3
-#define O_CREAT     0100
-#define O_EXCL      0200
-#define O_NOCTTY    0400
-#define O_TRUNC     01000
-#define O_APPEND    02000
-#define O_NONBLOCK  04000
-#define O_DSYNC     010000
-#define O_SYNC      04010000
-#define O_RSYNC     04010000
-#define O_DIRECTORY 0200000
-#define O_NOFOLLOW  0400000
-#define O_CLOEXEC   02000000
-
-#define O_ASYNC     020000
-#define O_DIRECT    040000
-#define O_LARGEFILE 0100000
-#define O_NOATIME   01000000
-#define O_PATH      010000000
-#define O_TMPFILE   020200000
-#define O_NDELAY    O_NONBLOCK
+/* POSIX ABI constants (F_* / O_* / SEEK_* / DT_* / AT_* / UTIME_*) live in
+ * <abi/posix.h>. Include it explicitly where needed; this header stays
+ * VFS-type-only so filesystem drivers do not inherit the libc ABI surface. */
 
 #include "proto.hpp"
 #include "list.h"
@@ -102,6 +32,8 @@ typedef errno_t (*vfs_stat_t)(void *file, vfs_node_t node);
 typedef errno_t (*vfs_mk_t)(void *parent, const char *name, vfs_node_t node);
 typedef errno_t (*vfs_del_t)(void *parent, vfs_node_t node);
 typedef errno_t (*vfs_rename_t)(void *current, const char *nw);
+typedef errno_t (*vfs_chmod_t)(vfs_node_t node, uint16_t mode);
+typedef errno_t (*vfs_chown_t)(vfs_node_t node, uint32_t uid, uint32_t gid);
 
 // VFS扩展接口 (CPOS特有, PLOS不支持)
 typedef errno_t (*vfs_ioctl_t)(void *file, size_t req, void *arg);
@@ -148,6 +80,8 @@ typedef struct vfs_callback { // VFS回调函数
     vfs_resize_t   resize;    // 调整文件大小
     vfs_del_t      del;         // 删除文件或文件夹
     vfs_rename_t   rename;      // 重命名文件或文件夹
+    vfs_chmod_t    chmod;       // 持久化 mode（可选；NULL = 仅内存态）
+    vfs_chown_t    chown;       // 持久化 owner/group（可选）
 } *vfs_callback_t;
 
 typedef struct vfs_filesystem {
@@ -160,7 +94,6 @@ typedef struct vfs_filesystem {
 } *vfs_filesystem_t;
 
 struct vfs_node {           // vfs节点
-    uint64_t   ime_protection; // 内核态对象策略标记（模块经 resolved-name 钩子设置）
     vfs_node_t parent;      // 父目录
     vfs_node_t linkto;      // 符号链接指向的节点
     char      *name;        // 名称
@@ -189,49 +122,81 @@ struct vfs_node {           // vfs节点
     uint64_t   rdev;        // 真实设备号
 };
 
-struct fd {
-    void  *file;
-    size_t offset;
-    bool   readable;
-    bool   writeable;
-};
+/* DAC 权限位的单一入口。历史上 chmod 写 mode、ext4 stat 读 permissions，
+   两份字段会漂移；所有读写 mode 的地方都必须经过这两个 helper。 */
+static inline uint32_t vfs_node_mode(vfs_node_t node)
+{
+    if (node == NULL) return 0;
+    return node->mode != 0 ? (uint32_t)node->mode : node->permissions;
+}
+
+static inline void vfs_node_set_mode(vfs_node_t node, uint32_t mode)
+{
+    if (node == NULL) return;
+    mode &= 07777U;
+    node->mode        = (uint16_t)mode;
+    node->permissions = mode;
+}
 
 enum {
-    DEVFS_REGISTER_ID = 0, // 设备文件系统注册ID
-    MODFS_REGISTER_ID = 1, // 模块文件系统注册ID
-    TMPFS_REGISTER_ID = 2, // 临时文件系统注册ID
-    PIEFS_REGISTER_ID = 3, // 管道文件系统注册ID
-    NETFS_REGISTER_ID = 4, // 网络文件系统注册ID
-    CPFS_REGISTER_ID  = 5, // CPIO文件系统注册ID
-    PROC_REGISTER_ID  = 6, // 进程信息文件系统注册ID
-    DNS_REGISTER_ID   = 7, // DNS 文件系统注册ID
-    NM_REGISTER_ID    = 8, // NetworkManager 运行态文件系统注册ID
+    /* 注册 ID 约定：
+       - 0 = 设备类文件系统（按设备路径探测，mount(2) 需要 device 参数）
+       - 非 0 = 虚拟文件系统，由 vfs_mount_virtual() 按 ID 精确选择
+       - 负数 = 不可挂载的内部回调，不参与 ID 查找或自动探测 */
+    VFS_DEVICE_REGISTER_ID   = 0,  // 设备类文件系统（ext4/fatfs）
+    VFS_REGISTER_INTERNAL    = -1, // 不可挂载的内部注册（如 proc_self）
+    MODFS_REGISTER_ID        = 1,  // 模块文件系统注册ID
+    TMPFS_REGISTER_ID        = 2,  // 临时文件系统注册ID
+    PIEFS_REGISTER_ID        = 3,  // 管道文件系统注册ID
+    NETFS_REGISTER_ID        = 4,  // 网络文件系统注册ID
+    CPFS_REGISTER_ID         = 5,  // CPIO文件系统注册ID
+    PROC_REGISTER_ID         = 6,  // 进程信息文件系统注册ID
+    DNS_REGISTER_ID          = 7,  // DNS 文件系统注册ID
+    NM_REGISTER_ID           = 8,  // NetworkManager 运行态文件系统注册ID
+    DEVFS_REGISTER_ID        = 9,  // 设备文件系统注册ID（虚拟 ID，必须非 0）
 };
 
 extern struct vfs_callback vfs_empty_callback;
 extern vfs_node_t          rootdir;
 extern struct llist_header fs_metadata_list;
 
-// 通用 VFS 访问策略钩子（内核态模块注册，如 IME 文件保护）。返回 true = 放行。
-// 无钩子时默认放行，不影响精简内核的普通文件访问。
-typedef enum {
-    VFS_ACCESS_READ = 0,
-    VFS_ACCESS_WRITE = 1,
-    VFS_ACCESS_REMOVE = 2,
-    VFS_ACCESS_MOUNT = 3,
+// 通用 VFS 访问策略钩子（权限层、审计或沙箱模块注册）。返回 true = 放行。
+// 无钩子时默认放行。0..8 的数值沿用既有模块 ABI，新增操作只能追加。
+typedef enum
+{
+    VFS_ACCESS_READ       = 0,
+    VFS_ACCESS_WRITE      = 1,
+    VFS_ACCESS_REMOVE     = 2,
+    VFS_ACCESS_MOUNT      = 3,
+    VFS_ACCESS_LOOKUP     = 4,
+    VFS_ACCESS_LIST       = 5,
+    VFS_ACCESS_STAT       = 6,
+    VFS_ACCESS_READ_WRITE = 7,
+    VFS_ACCESS_EXPORT     = 8,
+    VFS_ACCESS_EXEC       = 9  /* file execute bit */
 } vfs_access_op_t;
 
 typedef bool (*vfs_access_hook_t)(vfs_node_t node, const char *path, vfs_access_op_t op);
-typedef void (*vfs_resolved_name_hook_t)(vfs_node_t node, const char *name);
-
 void vfs_set_access_hook(vfs_access_hook_t fn);
 // 追加策略钩子（权限层/模块可共存；返回 false = 钩子表已满）
 bool vfs_add_access_hook(vfs_access_hook_t fn);
-void vfs_set_resolved_name_hook(vfs_resolved_name_hook_t fn);
-// 内核内部：访问策略判定（无钩子时默认放行）
+// 通用 hook 链；无钩子时默认放行。
 bool vfs_access_allowed(vfs_node_t node, const char *path, vfs_access_op_t op);
-// 内核内部：FAT 名称解析后回调（无钩子时 no-op）
-void vfs_notify_resolved_name(vfs_node_t node, const char *name);
+
+/* VFS 权限原语：清错误、调用 hook、保留 errno。 */
+bool vfs_check_access(vfs_node_t node, const char *path, int operation);
+/* 创建类操作原语：用已解析父节点 + name 构造 canonical path 再检查。 */
+bool vfs_check_child_creation(vfs_node_t parent, const char *name);
+int  vfs_last_error();
+void vfs_clear_access_error();
+void vfs_set_access_error(int error);
+/* DAC 属性设置：优先交给文件系统持久化，失败不修改 VFS 节点。 */
+errno_t vfs_chmod(vfs_node_t node, uint32_t mode);
+errno_t vfs_chown(vfs_node_t node, uint32_t uid, uint32_t gid);
+/* 文件系统内部块设备 I/O：挂载时已完成授权，不再按调用者 DAC 检查。 */
+size_t vfs_read_raw(vfs_node_t file, void *addr, size_t offset, size_t size);
+size_t vfs_write_raw(vfs_node_t file, const void *addr, size_t offset, size_t size);
+errno_t vfs_ioctl_raw(vfs_node_t device, size_t request, void *arg);
 
 void vfs_child_lock();
 void vfs_child_unlock();
@@ -315,8 +280,6 @@ void vfs_update(vfs_node_t node);
 vfs_node_t vfs_open(const char *str);
 vfs_node_t vfs_open_no_follow(const char *str);
 
-errno_t vfs_register_alias(const char *alias_path, const char *target_path);
-
 /**
  * 向一个节点发送 I/O 控制命令
  * @param device 节点设备
@@ -340,7 +303,7 @@ size_t vfs_readlink(vfs_node_t node, char *buf, size_t bufsize);
  * @param type 类型
  * @return 句柄(NULL为找不到)
  */
-vfs_filesystem_t get_filesystem(char *type);
+vfs_filesystem_t get_filesystem(const char *type);
 
 /**
  * 获取指定文件节点的文件系统描述符
@@ -349,33 +312,48 @@ vfs_filesystem_t get_filesystem(char *type);
  */
 vfs_filesystem_t get_filesystem_node(vfs_node_t node);
 
-bool is_virtual_fs(const char *src);
-
 vfs_node_t vfs_do_search(vfs_node_t dir, const char *name);
 void       vfs_free_child(vfs_node_t vfs);
 errno_t    vfs_delete(vfs_node_t node);
 errno_t    vfs_rename(vfs_node_t node, const char *nw);
 errno_t    vfs_resize(vfs_node_t node, uint64_t size);
-errno_t    vfs_resize_fast(vfs_node_t node, uint64_t size);
 errno_t    vfs_poll(vfs_node_t node, size_t event);
 void      *vfs_map(vfs_node_t node, uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags,
                    uint64_t offset);
+
+/* Optional resolver for "/dev/tty": returns the controlling terminal node of the
+ * calling session (with a reference taken), or NULL to use the static devfs
+ * node. The terminal layer installs it so the VFS core does not depend on PTY
+ * internals. */
+typedef vfs_node_t (*vfs_ctty_resolver_t)(void);
+void vfs_set_ctty_resolver(vfs_ctty_resolver_t resolver);
 size_t     vfs_read(vfs_node_t file, void *addr, size_t offset, size_t size);  // 读取节点数据
 size_t     vfs_write(vfs_node_t file, void *addr, size_t offset, size_t size); // 写入节点
-size_t     vfs_write_fast(vfs_node_t file, void *addr, size_t offset, size_t size);
 void *general_map(vfs_read_t read_callback, void *file, uint64_t addr, uint64_t len, uint64_t prot,
                   uint64_t flags, uint64_t offset); // 文件映射
 
 /**
- * 挂载一个文件系统到指定节点
-  * 挂载后，src 代表设备的路径，node 代表挂载点
-  * 挂载点必须是一个目录
-  *
- * @param src 设备路径
- * @param node 挂载点
+ * 挂载一个设备类文件系统到指定节点
+ * - type != NULL: 只调用该类型文件系统的 mount 回调
+ * - type == NULL: 按注册顺序自动探测设备类文件系统
+ *
+ * @param device 设备路径（可为 NULL，由具体文件系统决定）
+ * @param type   文件系统类型名（NULL = 自动探测）
+ * @param node   挂载点，必须是目录
  * @return 非0代表挂载失败
  */
-errno_t vfs_mount(const char *src, vfs_node_t node);
+errno_t vfs_mount_device(const char *device, const char *type, vfs_node_t node);
+
+/**
+ * 按注册 ID 挂载虚拟文件系统到指定节点
+ * mount 回调以 src = NULL 调用，不再传整数伪指针。
+ *
+ * @param register_id vfs_filesystem_t::id（非 0）
+ * @param node        挂载点，必须是目录
+ * @return 非0代表挂载失败
+ */
+errno_t vfs_mount_virtual(int register_id, vfs_node_t node);
+
 // 指定文件系统挂载（fstype 精确匹配，不再试遍所有回调）
 errno_t vfs_mount_as(vfs_filesystem_t fs, const char *src, vfs_node_t node);
 

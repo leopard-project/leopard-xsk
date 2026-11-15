@@ -4,6 +4,7 @@
 #include <fs/fatfs/fatfs.h>
 #include <fs/ext4/ext4.h>
 #include <ioctl.h>
+#include <abi/posix.h>
 #include <cpu/fsgsbase.h>
 #include <task/poll.h>
 #include <mm/lazyalloc.h>
@@ -14,12 +15,14 @@
 #include <net/socket.h>
 #include <net/unixsock.h>
 #include <pipe.h>
+#include <pty.h>
 #include <rtc.h>
 #include <tty.h>
 #include <task/ipc.h>
 #include <mutex.h>
 #include <math.hpp>
 #include <user/user.h>
+#include <user/permissions.h>
 #include <rng.h>
 
 extern lock_queue *pcb_group_queue;
@@ -188,13 +191,14 @@ static uint64_t fill_stat_from_node(vfs_node_t node, struct stat *out)
     out->st_uid     = (int)node->owner;
     out->st_ino     = node->inode;
     out->st_size    = node->size == (uint64_t)-1 ? 0 : (long long int)node->size;
-    out->st_mode    = node->mode | ((node->type & file_symlink)  ? S_IFLNK
+    out->st_mode    = (int)vfs_node_mode(node) | ((node->type & file_symlink)  ? S_IFLNK
                                    : (node->type & file_dir)    ? S_IFDIR
                                    : (node->type & file_block)  ? S_IFBLK
                                    : (node->type & file_socket) ? S_IFSOCK
                                    : (node->type & file_pipe)   ? S_IFIFO
                                    : (node->type & file_none)   ? S_IFREG
                                    : (node->type & file_stream) ? S_IFCHR
+                                   : (node->type & file_fbdev)  ? S_IFCHR
                                                                 : S_IFREG);
     out->st_nlink   = 1;
     out->st_dev     = (long)node->dev;
@@ -217,18 +221,32 @@ static uint32_t current_gid()
     return user_gid(task_effective_user());
 }
 
-static void stamp_node_owner(vfs_node_t node)
+/* DAC 属性修改授权：chmod 仅 owner/Root；chown 仅 Root，
+   非 Root 只能把自己的文件换到自己的组。 */
+static bool may_chmod_node(vfs_node_t node)
 {
-    if (node == NULL) return;
-    node->owner = current_uid();
-    node->group = current_gid();
+    return node != NULL && (current_uid() == 0 || node->owner == current_uid());
+}
+
+static bool may_chown_node(vfs_node_t node, uint32_t owner, uint32_t group)
+{
+    if (node == NULL) return false;
+    if (current_uid() == 0) return true;
+    return owner == UINT32_MAX && group == current_gid() && node->owner == current_uid();
+}
+
+/* 将 VFS 记录在任务上的权限错误传播给用户态；没有权限错误时使用 fallback。 */
+static int vfs_syscall_error(int fallback)
+{
+    int error = vfs_last_error();
+    return (error == EACCES || error == EPERM || error == EROFS) ? error : fallback;
 }
 
 static uint64_t stat_kernel_path(const char *path, struct stat *out)
 {
     if (path == NULL || out == NULL) return SYSCALL_FAULT_(EINVAL);
     vfs_node_t node = vfs_open(path);
-    if (node == NULL) return SYSCALL_FAULT_(ENOENT);
+    if (node == NULL) return SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     uint64_t ret = fill_stat_from_node(node, out);
     vfs_close(node);
     return ret;
@@ -238,7 +256,7 @@ static uint64_t lstat_kernel_path(const char *path, struct stat *out)
 {
     if (path == NULL || out == NULL) return SYSCALL_FAULT_(EINVAL);
     vfs_node_t node = vfs_open_no_follow(path);
-    if (node == NULL) return SYSCALL_FAULT_(ENOENT);
+    if (node == NULL) return SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     uint64_t ret = fill_stat_from_node(node, out);
     vfs_close(node);
     return ret;
@@ -356,7 +374,7 @@ static int64_t write_from_user_buffer(fd_file_handle *handle, const uint8_t *buf
         if ((ssize_t)wrote < 0)
         {
             free(bounce);
-            return total > 0 ? (int64_t)total : wrote == (size_t)VFS_STATUS_FAILED ? -EIO : (int64_t)wrote;
+            return total > 0 ? (int64_t)total : wrote == (size_t)VFS_STATUS_FAILED ? (int64_t)-vfs_syscall_error(EIO) : (int64_t)wrote;
         }
         if (!(handle->node->type & file_pipe) && handle->node->size != (uint64_t)-1) handle->offset += wrote;
         total += wrote;
@@ -510,7 +528,7 @@ static int64_t read_to_user_buffer(fd_file_handle *handle, uint8_t *buffer, size
             if ((ssize_t)got < 0)
             {
                 free(bounce);
-                return total > 0 ? (int64_t)total : got == (size_t)VFS_STATUS_FAILED ? -EIO : (int64_t)got;
+                return total > 0 ? (int64_t)total : got == (size_t)VFS_STATUS_FAILED ? (int64_t)-vfs_syscall_error(EIO) : (int64_t)got;
             }
             read_now = (ssize_t)got;
         }
@@ -544,7 +562,7 @@ static int64_t pipe_read_to_user_buffer(fd_file_handle *handle, uint8_t *buffer,
     if (got == (size_t)VFS_STATUS_FAILED)
     {
         free(bounce);
-        return -EIO;
+        return -vfs_syscall_error(EIO);
     }
 
     if (got != 0 && !copy_to_user_pagedir(current_user_pagedir(), buffer, bounce, got))
@@ -557,10 +575,13 @@ static int64_t pipe_read_to_user_buffer(fd_file_handle *handle, uint8_t *buffer,
     return (int64_t)got;
 }
 
-static bool wait4_pid_matches(pcb_t child, long pid)
+static bool wait4_pid_matches(pcb_t parent, pcb_t child, long pid)
 {
     if (child == NULL) return false;
-    return pid == -1 ? true : (long)child->pid == pid;
+    if (pid == -1) return true;
+    if (pid == 0) return parent != NULL && child->pgid == parent->pgid;
+    if (pid > 0) return (long)child->pid == pid;
+    return child->pgid == (size_t)(-pid);
 }
 
 static pcb_t wait4_find_child(pcb_t parent, long pid)
@@ -572,7 +593,7 @@ static pcb_t wait4_find_child(pcb_t parent, long pid)
     queue_foreach(parent->child_pcb, node)
     {
         pcb_t child = (pcb_t)node->data;
-        if (wait4_pid_matches(child, pid))
+        if (wait4_pid_matches(parent, child, pid))
         {
             found = child;
             break;
@@ -592,7 +613,7 @@ static pcb_t wait4_find_zombie_child(pcb_t parent, long pid)
     queue_foreach(parent->child_pcb, node)
     {
         pcb_t child = (pcb_t)node->data;
-        if (child != NULL && child->status == ZOMBIE && wait4_pid_matches(child, pid))
+        if (child != NULL && child->status == ZOMBIE && wait4_pid_matches(parent, child, pid))
         {
             found = child;
             break;
@@ -615,7 +636,9 @@ static ipc_message_t wait4_pop_exit_message(pcb_t parent, long pid, bool wait)
             ipc_message_t message = (ipc_message_t)queue_dequeue(parent->ipc_queue);
             if (message == NULL) break;
 
-            if (message->type == IPC_MSG_TYPE_EPID && (pid == -1 || message->pid == pid)) return message;
+            pcb_t child = wait4_find_child(parent, message->pid);
+            if (message->type == IPC_MSG_TYPE_EPID && wait4_pid_matches(parent, child, pid))
+                return message;
 
             lock_queue_enqueue(parent->ipc_queue, message);
         }
@@ -705,17 +728,18 @@ static uint64_t open_kernel_path(char *path0, uint64_t flags, uint64_t mode)
             if (node == NULL)
                 goto err;
             else {
-                stamp_node_owner(node);
-                pcb_t process = get_current_task()->parent_group;
-                uint64_t create_mode = mode & ~(process != NULL ? process->umask : 0);
-                if ((create_mode & 07777) != 0) node->mode = (uint16_t)(create_mode & 07777);
+                pcb_t process = get_current_task() != NULL ? get_current_task()->parent_group : NULL;
+                uint32_t create_mode = (uint32_t)mode & 07777U;
+                if (create_mode == 0) create_mode = (node->type & file_dir) ? 0777U : 0666U;
+                create_mode &= ~(process != NULL ? (process->umask & 0777U) : 022U);
+                vfs_chmod(node, create_mode);
                 goto next;
             }
         }
         else
         err:
             free(normalized_path);
-        return SYSCALL_FAULT_(ENOENT);
+        return SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     }
 next:
     vfs_update(node);
@@ -1336,7 +1360,6 @@ sys_(wait4, unsigned long pid_value, int *status, int options, void *rusage)
     (void)rusage;
     if (parent == NULL || parent->child_pcb == NULL) return SYSCALL_FAULT_(ECHILD);
     if ((options & ~(LINUX_WNOHANG | LINUX_WUNTRACED | LINUX_WCONTINUED)) != 0) return SYSCALL_FAULT_(EINVAL);
-    if (pid < -1 || pid == 0) return SYSCALL_FAULT_(EINVAL);
     if (wait4_find_child(parent, pid) == NULL) return SYSCALL_FAULT_(ECHILD);
 
     if (trace)
@@ -1675,6 +1698,11 @@ sys_(ioctl, int fd, int options, void *arg2)
     if (unlikely(fd < 0)) return SYSCALL_FAULT_(EINVAL);
     fd_file_handle *handle =  (fd_file_handle*)queue_get(get_current_task()->parent_group->file_open, fd);
     if (handle == NULL) return SYSCALL_FAULT_(EBADF);
+
+    // TIOCSCTTY is the Linux oddity: its third argument is a value (0 or 1),
+    // not a user pointer. Pass it through opaquely to the terminal driver.
+    if (options == TIOCSCTTY)
+        return vfs_ioctl(handle->node, options, (void *)(uintptr_t)arg2);
 
     size_t arg_size = ioctl_arg_size(options);
     void *karg = arg2;
@@ -2515,7 +2543,7 @@ sys_(chdir, char *s)
     if ((node = vfs_open(normalized_path)) == NULL)
     {
         free(normalized_path);
-        return SYSCALL_FAULT_(ENOENT);
+        return SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     }
 
     uint64_t ret = set_current_cwd(node, normalized_path);
@@ -2929,11 +2957,16 @@ sys_(rt_sigaction, int sig, sigaction_t *action, sigaction_t *oldaction, size_t 
 
 sys_(kill, int pid, int sig)
 {
-    pcb_t target = NULL;
-    if (pid > 0) target = found_pcb(pid);
-    else if (pid == 0) target = get_current_task()->parent_group;
-    else return SYSCALL_FAULT_(ENOSYS);
+    tcb_t task    = get_current_task();
+    pcb_t current = task != NULL ? task->parent_group : NULL;
+    if (current == NULL) return SYSCALL_FAULT_(ESRCH);
 
+    // Linux job control relies on the negative-PID process-group form.
+    if (pid == -1) return signal_send_session(current->sid, sig);
+    if (pid == 0) return signal_send_group((int)current->pgid, sig);
+    if (pid < -1) return signal_send_group(-pid, sig);
+
+    pcb_t target = found_pcb(pid);
     if (target == NULL) return SYSCALL_FAULT_(ESRCH);
     int ret = signal_send_process(target, sig);
     return ret < 0 ? (uint64_t)ret : (uint64_t)ret;
@@ -3256,14 +3289,16 @@ sys_(mkdir, char *name, uint64_t mode)
     char  *npath = vfs_cwd_path_build(user_path);
     free(user_path);
     if (npath == NULL) return SYSCALL_FAULT_(ENOMEM);
-    size_t ret   = vfs_mkdir(npath) == VFS_STATUS_FAILED ? SYSCALL_FAULT_(EIO) : 0;
+    size_t ret   = vfs_mkdir(npath) == VFS_STATUS_FAILED ? SYSCALL_FAULT_(vfs_syscall_error(EIO)) : 0;
     if (ret == 0)
     {
         vfs_node_t node = vfs_open(npath);
         if (node != NULL)
         {
-            stamp_node_owner(node);
-            if ((mode & 07777) != 0) node->mode = (uint16_t)(mode & 07777);
+            pcb_t process = get_current_task() != NULL ? get_current_task()->parent_group : NULL;
+            uint32_t create_mode = (uint32_t)(mode & 07777U) ? (uint32_t)(mode & 07777U) : 0777U;
+            create_mode &= ~(process != NULL ? (process->umask & 0777U) : 022U);
+            vfs_chmod(node, create_mode);
             vfs_close(node);
         }
     }
@@ -3839,14 +3874,14 @@ sys_(unlink)
     free(user_path);
     if (npath == NULL) return SYSCALL_FAULT_(ENOMEM);
     vfs_node_t node  = vfs_open_no_follow(npath);
-    if (node == NULL) { free(npath); return SYSCALL_FAULT_(ENOENT); }
+    if (node == NULL) { free(npath); return SYSCALL_FAULT_(vfs_syscall_error(ENOENT)); }
     if (node->type != file_none && node->type != file_symlink)
     {
         vfs_close(node);
         free(npath);
         return SYSCALL_FAULT_(ENOTDIR);
     }
-    size_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
+    size_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     free(npath);
     return ret;
 }
@@ -3863,14 +3898,14 @@ sys_(rmdir)
     free(user_path);
     if (n_name == NULL) return SYSCALL_FAULT_(ENOMEM);
     vfs_node_t node   = vfs_open_no_follow(n_name);
-    if (node == NULL) { free(n_name); return SYSCALL_FAULT_(ENOENT); }
+    if (node == NULL) { free(n_name); return SYSCALL_FAULT_(vfs_syscall_error(ENOENT)); }
     if (node->type != file_dir)
     {
         vfs_close(node);
         free(n_name);
         return SYSCALL_FAULT_(ENOTDIR);
     }
-    size_t ret = vfs_delete(node);
+    uint64_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     free(n_name);
     return ret;
 }
@@ -3889,7 +3924,7 @@ sys_(unlinkat)
     if (node == NULL)
     {
         free(path);
-        return SYSCALL_FAULT_(ENOENT);
+        return SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     }
     if (node->type != file_none && node->type != file_symlink)
     {
@@ -3898,7 +3933,7 @@ sys_(unlinkat)
         return SYSCALL_FAULT_(ENOTDIR);
     }
 
-    uint64_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
+    uint64_t ret = vfs_delete(node) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     free(path);
     return ret;
 }
@@ -4003,7 +4038,6 @@ sys_(openat)
 
 sys_(mkdirat, int dirfd, char *pathname, uint64_t mode)
 {
-    (void)mode;
     if (pathname == NULL) return SYSCALL_FAULT_(EINVAL);
 
     char *resolved = NULL;
@@ -4011,8 +4045,20 @@ sys_(mkdirat, int dirfd, char *pathname, uint64_t mode)
     if (path_ret < 0) return SYSCALL_FAULT_((int)-path_ret);
 
     errno_t ret = vfs_mkdir(resolved);
+    if (ret == VFS_STATUS_SUCCESS)
+    {
+        vfs_node_t node = vfs_open(resolved);
+        if (node != NULL)
+        {
+            pcb_t process = get_current_task() != NULL ? get_current_task()->parent_group : NULL;
+            uint32_t create_mode = (uint32_t)(mode & 07777U) ? (uint32_t)(mode & 07777U) : 0777U;
+            create_mode &= ~(process != NULL ? (process->umask & 0777U) : 022U);
+            vfs_chmod(node, create_mode);
+            vfs_close(node);
+        }
+    }
     free(resolved);
-    return ret == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(EIO);
+    return ret == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_syscall_error(EIO));
 }
 
 sys_(flistxattr, int fd, char *list, size_t size)
@@ -4159,7 +4205,7 @@ sys_(mount, char *dev_name, char *dir_name, char *type, uint64_t flags, void *da
     if (!dir)
     {
         free(ndir_name);
-        return SYSCALL_FAULT_(ENOENT);
+        return SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     }
 
     if (flags & MS_MOVE)
@@ -4210,10 +4256,15 @@ sys_(mount, char *dev_name, char *dir_name, char *type, uint64_t flags, void *da
     vfs_filesystem_t filesystem = get_filesystem(ktype);
     free(ktype);
     if (filesystem == NULL) { free(ndir_name); return SYSCALL_FAULT_(EINVAL); }
+
+    /* 虚拟文件系统按注册 ID 挂载，不需要设备路径。 */
     if (filesystem->id != 0)
     {
-        ndev_name = (char *)filesystem->id;
-        goto mount;
+        errno_t mount_ret = vfs_mount_virtual(filesystem->id, dir);
+        free(ndir_name);
+        if (mount_ret == VFS_STATUS_FAILED)
+            return SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
+        return 0;
     }
 
     if (dev_name == NULL) { free(ndir_name); return SYSCALL_FAULT_(EINVAL); }
@@ -4222,28 +4273,55 @@ sys_(mount, char *dev_name, char *dir_name, char *type, uint64_t flags, void *da
     ndev_name = vfs_cwd_path_build(udev_name);
     free(udev_name);
     if (ndev_name == NULL) { free(ndir_name); return SYSCALL_FAULT_(ENOMEM); }
-mount:
-    if (vfs_mount_as(filesystem, (const char *)ndev_name, dir) == VFS_STATUS_FAILED)
+
+    if (vfs_mount_as(filesystem, ndev_name, dir) == VFS_STATUS_FAILED)
     {
         free(ndir_name);
         free(ndev_name);
-        return SYSCALL_FAULT_(ENOENT);
+        return SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     }
     free(ndir_name);
-    if (filesystem->id == 0) free(ndev_name);
+    free(ndev_name);
     return 0;
 }
 
 sys_(setpgid, int pid, int pgid)
 {
-    pcb_t process = pid == 0 ? get_current_task()->parent_group : found_pcb(pid);
-    if (process == NULL || process->status == DEATH) { return SYSCALL_FAULT_(ESRCH); }
-    if (pgid == 0) { pgid = process->pid; }
-    process->pid = pgid;
+    tcb_t current_task = get_current_task();
+    pcb_t current      = current_task != NULL ? current_task->parent_group : NULL;
+    if (current == NULL) { return SYSCALL_FAULT_(ESRCH); }
+
+    pcb_t process = pid == 0 ? current : found_pcb(pid);
+    if (process == NULL || process->status == DEATH || process->status == OUT ||
+        process->status == ZOMBIE)
+    {
+        return SYSCALL_FAULT_(ESRCH);
+    }
+
+    // POSIX: a process may only change its own group or that of a child.
+    if (process != current && process->parent_task != current) return SYSCALL_FAULT_(EPERM);
+    // A session leader is also a process-group leader and cannot switch groups.
+    if (process->pid == process->sid) return SYSCALL_FAULT_(EPERM);
+    // No moving a process outside its current session.
+    if (process->sid != current->sid) return SYSCALL_FAULT_(EPERM);
+    if (pgid < 0) return SYSCALL_FAULT_(EINVAL);
+
+    if (pgid == 0) { pgid = (int)process->pid; }
+
+    // The target may create a group named after itself; otherwise pgid must
+    // already be a live process group in the same session.
+    if ((size_t)pgid != process->pid)
+    {
+        pcb_t member = found_pgrp(pgid);
+        if (member == NULL || member->sid != current->sid)
+            return SYSCALL_FAULT_(EPERM);
+    }
+
+    // Only the group ID changes; PID identity (wait/kill/procfs) stays stable.
+    process->pgid = (size_t)pgid;
 
     // Keep the controlling tty foreground pgrp in sync for Linux userland job control.
-    tcb_t current = get_current_task();
-    if (current != NULL && current->parent_group == process)
+    if (current == process)
     {
         for (int fd = 0; fd <= 2; fd++)
         {
@@ -4255,26 +4333,40 @@ sys_(setpgid, int pid, int pgid)
     return 0;
 }
 
-sys_(getpgid)
+sys_(getpgid, int pid)
 {
-    size_t pid     = arg0;
-    pcb_t  process = pid == 0 ? get_current_task()->parent_group : found_pcb(pid);
+    pcb_t process = pid == 0 ? get_current_task()->parent_group : found_pcb(pid);
     if (process == NULL || process->status == DEATH) { return SYSCALL_FAULT_(ESRCH); }
-    return process->pid;
+    return process->pgid;
 }
 
 sys_(setsid)
 {
-    pcb_t process = get_current_task()->parent_group;
+    tcb_t task    = get_current_task();
+    pcb_t process = task != NULL ? task->parent_group : NULL;
     if (process == NULL) return SYSCALL_FAULT_(ESRCH);
-    return process->pid;
+
+    // A process-group leader (including a session leader) cannot start a new session.
+    if (process->pid == process->pgid) return SYSCALL_FAULT_(EPERM);
+
+    size_t old_sid = process->sid;
+
+    process->sid  = process->pid;
+    process->pgid = process->pid;
+
+    // Drop this process's controlling-terminal attachment if it owned one.
+    // (setsid cannot succeed for a session leader, so this only affects the
+    // explicit TIOCSCTTY-steal case.)
+    pty_detach_controlling(old_sid, process->pid);
+
+    return process->sid;
 }
 
 sys_(getsid, int pid)
 {
     pcb_t process = pid == 0 ? get_current_task()->parent_group : found_pcb(pid);
     if (process == NULL || process->status == DEATH) return SYSCALL_FAULT_(ESRCH);
-    return process->pid;
+    return process->sid;
 }
 
 
@@ -4373,15 +4465,15 @@ sys_(rename, char *oldpath, char *newpath)
         free(nnewpath);
         return SYSCALL_FAULT_(ENOMEM);
     }
-    if (!vfs_access_allowed(NULL, noldpath, VFS_ACCESS_REMOVE) ||
-        !vfs_access_allowed(NULL, nnewpath, VFS_ACCESS_WRITE))
+    if (!vfs_check_access(NULL, noldpath, VFS_ACCESS_REMOVE) ||
+        !vfs_check_access(NULL, nnewpath, VFS_ACCESS_WRITE))
     { free(noldpath); free(nnewpath); return SYSCALL_FAULT_(EACCES); }
     vfs_node_t oldnode  = vfs_open_no_follow(noldpath);
     if (!oldnode)
     {
         free(noldpath);
         free(nnewpath);
-        return SYSCALL_FAULT_(ENOENT);
+        return SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     }
     vfs_node_t newnode = vfs_open_no_follow(nnewpath);
     if (newnode == oldnode)
@@ -4391,7 +4483,7 @@ sys_(rename, char *oldpath, char *newpath)
         return 0;
     }
     if (newnode) { vfs_delete(newnode); }
-    size_t     ret    = vfs_rename(oldnode, nnewpath) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
+    size_t     ret    = vfs_rename(oldnode, nnewpath) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     char      *parent = get_parent_path(nnewpath);
     vfs_node_t parent_dir = vfs_open(parent);
     if (!parent_dir)
@@ -4423,8 +4515,8 @@ sys_(renameat, int olddirfd, char *oldpath, int newdirfd, char *newpath)
         return SYSCALL_FAULT_((int)-path_ret);
     }
 
-    if (!vfs_access_allowed(NULL, resolved_old, VFS_ACCESS_REMOVE) ||
-        !vfs_access_allowed(NULL, resolved_new, VFS_ACCESS_WRITE))
+    if (!vfs_check_access(NULL, resolved_old, VFS_ACCESS_REMOVE) ||
+        !vfs_check_access(NULL, resolved_new, VFS_ACCESS_WRITE))
     {
         free(resolved_old);
         free(resolved_new);
@@ -4436,7 +4528,7 @@ sys_(renameat, int olddirfd, char *oldpath, int newdirfd, char *newpath)
     {
         free(resolved_old);
         free(resolved_new);
-        return SYSCALL_FAULT_(ENOENT);
+        return SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     }
 
     vfs_node_t newnode = vfs_open_no_follow(resolved_new);
@@ -4448,7 +4540,7 @@ sys_(renameat, int olddirfd, char *oldpath, int newdirfd, char *newpath)
     }
     if (newnode) { vfs_delete(newnode); }
 
-    uint64_t ret = vfs_rename(oldnode, resolved_new) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(ENOENT);
+    uint64_t ret = vfs_rename(oldnode, resolved_new) == VFS_STATUS_SUCCESS ? 0 : SYSCALL_FAULT_(vfs_syscall_error(ENOENT));
     vfs_close(oldnode);
     free(resolved_old);
     free(resolved_new);
@@ -4549,7 +4641,7 @@ sys_(umount2)
     if (path == NULL) return SYSCALL_FAULT_(ENOMEM);
 
     uint64_t status = vfs_unmount(path);
-    if (status == VFS_STATUS_FAILED) status = SYSCALL_FAULT_(EBUSY);
+    if (status == VFS_STATUS_FAILED) status = SYSCALL_FAULT_(vfs_syscall_error(EBUSY));
     free(path);
     return status;
 }
@@ -4763,18 +4855,38 @@ sys_(getgid)
     return current_gid();
 }
 
+/* 进程身份只有一份（UserInfo），uid/gid 由 XUT 等级推导。
+   setuid/setgid 的语义是“把进程身份切到 uid 对应的 XUT”，
+   只有 Root 能切到别的身份；切到自己当前 uid 恒成功。 */
+static bool switch_identity_to_uid(uint32_t uid)
+{
+    UserInfo target;
+    if (!user_identity_from_uid(uid, &target)) return false;
+
+    tcb_t task = get_current_task();
+    pcb_t process = task != NULL ? task->parent_group : NULL;
+    if (process == NULL) return false;
+
+    permissions_process_switch_identity(process, &target);
+    return true;
+}
+
 sys_(setuid, uint32_t uid)
 {
     uint32_t euid = current_uid();
-    if (uid == euid || euid == 0) return 0;
-    return SYSCALL_FAULT_(EPERM);
+    if (uid == euid) return 0;
+    if (euid != 0) return SYSCALL_FAULT_(EPERM);
+    if (!switch_identity_to_uid(uid)) return SYSCALL_FAULT_(EINVAL);
+    return 0;
 }
 
 sys_(setgid, uint32_t gid)
 {
     uint32_t egid = current_gid();
-    if (gid == egid || current_uid() == 0) return 0;
-    return SYSCALL_FAULT_(EPERM);
+    if (gid == egid) return 0;
+    if (current_uid() != 0) return SYSCALL_FAULT_(EPERM);
+    if (!switch_identity_to_uid(gid)) return SYSCALL_FAULT_(EINVAL);
+    return 0;
 }
 
 static bool linux_id_arg_allowed(uint32_t id, uint32_t current)
@@ -4785,9 +4897,18 @@ static bool linux_id_arg_allowed(uint32_t id, uint32_t current)
 sys_(setresuid, uint32_t ruid, uint32_t euid, uint32_t suid)
 {
     uint32_t uid = current_uid();
-    if (linux_id_arg_allowed(ruid, uid) && linux_id_arg_allowed(euid, uid) && linux_id_arg_allowed(suid, uid))
-        return 0;
-    return SYSCALL_FAULT_(EPERM);
+    if (!linux_id_arg_allowed(ruid, uid) || !linux_id_arg_allowed(euid, uid) ||
+        !linux_id_arg_allowed(suid, uid))
+        return SYSCALL_FAULT_(EPERM);
+    if (uid != 0) return 0;
+
+    uint32_t target = euid != (uint32_t)-1 ? euid
+                    : ruid != (uint32_t)-1 ? ruid
+                    : suid != (uint32_t)-1 ? suid
+                    : uid;
+    if (target == uid) return 0;
+    if (!switch_identity_to_uid(target)) return SYSCALL_FAULT_(EINVAL);
+    return 0;
 }
 
 sys_(getresuid, uint32_t *ruid, uint32_t *euid, uint32_t *suid)
@@ -4803,9 +4924,18 @@ sys_(getresuid, uint32_t *ruid, uint32_t *euid, uint32_t *suid)
 sys_(setresgid, uint32_t rgid, uint32_t egid, uint32_t sgid)
 {
     uint32_t gid = current_gid();
-    if (linux_id_arg_allowed(rgid, gid) && linux_id_arg_allowed(egid, gid) && linux_id_arg_allowed(sgid, gid))
-        return 0;
-    return SYSCALL_FAULT_(EPERM);
+    if (!linux_id_arg_allowed(rgid, gid) || !linux_id_arg_allowed(egid, gid) ||
+        !linux_id_arg_allowed(sgid, gid))
+        return SYSCALL_FAULT_(EPERM);
+    if (current_uid() != 0) return 0;
+
+    uint32_t target = egid != (uint32_t)-1 ? egid
+                    : rgid != (uint32_t)-1 ? rgid
+                    : sgid != (uint32_t)-1 ? sgid
+                    : gid;
+    if (target == gid) return 0;
+    if (!switch_identity_to_uid(target)) return SYSCALL_FAULT_(EINVAL);
+    return 0;
 }
 
 sys_(getresgid, uint32_t *rgid, uint32_t *egid, uint32_t *sgid)
@@ -4953,9 +5083,17 @@ sys_(chmod, char *path, uint64_t mode)
     free(resolved);
     if (node == NULL) return SYSCALL_FAULT_(ENOENT);
 
-    node->mode = (uint16_t)((node->mode & ~07777) | (mode & 07777));
+    if (!may_chmod_node(node))
+    {
+        vfs_close(node);
+        return SYSCALL_FAULT_(EPERM);
+    }
+
+    uint32_t new_mode = mode & 07777;
+    if (current_uid() != 0) new_mode &= ~06000U; // 非 Root 不得设置 setuid/setgid
+    int error = vfs_chmod(node, new_mode);
     vfs_close(node);
-    return 0;
+    return error < 0 ? SYSCALL_FAULT_(-error) : 0;
 }
 
 sys_(fchmod, int fd, uint64_t mode)
@@ -4963,15 +5101,32 @@ sys_(fchmod, int fd, uint64_t mode)
     if (fd < 0) return SYSCALL_FAULT_(EBADF);
     fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
-    handle->node->mode = (uint16_t)((handle->node->mode & ~07777) | (mode & 07777));
-    return 0;
+    if (!may_chmod_node(handle->node)) return SYSCALL_FAULT_(EPERM);
+
+    uint32_t new_mode = mode & 07777;
+    if (current_uid() != 0) new_mode &= ~06000U;
+    int error = vfs_chmod(handle->node, new_mode);
+    return error < 0 ? SYSCALL_FAULT_(-error) : 0;
 }
 
-static void apply_node_owner(vfs_node_t node, uint32_t owner, uint32_t group)
+static int apply_node_owner(vfs_node_t node, uint32_t owner, uint32_t group)
 {
-    if (node == NULL) return;
-    if (owner != UINT32_MAX) node->owner = owner;
-    if (group != UINT32_MAX) node->group = group;
+    if (node == NULL) return -EINVAL;
+    if (!may_chown_node(node, owner, group)) return -EPERM;
+
+    uint32_t old_owner = node->owner;
+    uint32_t old_group = node->group;
+    int error = vfs_chown(node, owner, group);
+    if (error < 0) return error;
+
+    /* chown(2): ownership change clears setuid/setgid so a file cannot be
+       handed to another account while retaining privilege bits. */
+    uint32_t mode = vfs_node_mode(node);
+    uint32_t clear = 0;
+    if (owner != UINT32_MAX && owner != old_owner) clear |= 06000U;
+    if (group != UINT32_MAX && group != old_group) clear |= 02000U;
+    if (clear != 0) vfs_chmod(node, mode & ~clear);
+    return 0;
 }
 
 sys_(chown, char *path, uint32_t owner, uint32_t group)
@@ -4984,8 +5139,8 @@ sys_(fchown, int fd, uint32_t owner, uint32_t group)
     if (fd < 0) return SYSCALL_FAULT_(EBADF);
     fd_file_handle *handle = (fd_file_handle *)queue_get(get_current_task()->parent_group->file_open, fd);
     if (handle == NULL || handle->node == NULL) return SYSCALL_FAULT_(EBADF);
-    apply_node_owner(handle->node, owner, group);
-    return 0;
+    int error = apply_node_owner(handle->node, owner, group);
+    return error < 0 ? SYSCALL_FAULT_(-error) : 0;
 }
 
 sys_(fchownat, int dirfd, char *pathname, uint32_t owner, uint32_t group, int flags)
@@ -5000,9 +5155,9 @@ sys_(fchownat, int dirfd, char *pathname, uint32_t owner, uint32_t group, int fl
     free(resolved);
     if (node == NULL) return SYSCALL_FAULT_(ENOENT);
 
-    apply_node_owner(node, owner, group);
+    int error = apply_node_owner(node, owner, group);
     vfs_close(node);
-    return 0;
+    return error < 0 ? SYSCALL_FAULT_(-error) : 0;
 }
 
 sys_(fchmodat, int dirfd, char *pathname, uint64_t mode, int flags)
@@ -5026,9 +5181,17 @@ sys_(fchmodat, int dirfd, char *pathname, uint64_t mode, int flags)
     free(resolved);
     if (node == NULL) return SYSCALL_FAULT_(ENOENT);
 
-    node->mode = (uint16_t)((node->mode & ~07777) | (mode & 07777));
+    if (!may_chmod_node(node))
+    {
+        vfs_close(node);
+        return SYSCALL_FAULT_(EPERM);
+    }
+
+    uint32_t new_mode = mode & 07777;
+    if (current_uid() != 0) new_mode &= ~06000U;
+    int error = vfs_chmod(node, new_mode);
     vfs_close(node);
-    return 0;
+    return error < 0 ? SYSCALL_FAULT_(-error) : 0;
 }
 
 sys_(utimensat, int dirfd, char *pathname, const struct timespec *times, int flags)
@@ -5252,7 +5415,7 @@ sys_(mincore, uint64_t addr, uint64_t size, uint64_t vec)
 
 sys_(pivot_root, char *new_root, char *put_old)
 {
-    if (!vfs_access_allowed(NULL, NULL, VFS_ACCESS_MOUNT)) return SYSCALL_FAULT_(EPERM);
+    if (!vfs_check_access(NULL, NULL, VFS_ACCESS_MOUNT)) return SYSCALL_FAULT_(EPERM);
     //TODO 未经测试和验证的实现
     vfs_node_t nroot = vfs_open(new_root);
     vfs_node_t src_root;

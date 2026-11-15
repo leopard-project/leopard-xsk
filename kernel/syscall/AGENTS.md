@@ -9,7 +9,8 @@ Kernel/user boundary implementation. This subtree wires syscall entry, dispatch,
 | Syscall CPU entry | `syscall.cpp` | Programs EFER/STAR/LSTAR/SYSCALL_MASK. |
 | Main syscall table/handlers | `sys.cpp` | Large dispatch surface; high-risk file. |
 | File syscalls | `sys.cpp`, `xapi/xfile.cpp` | VFS handles and user copy wrappers. |
-| GUI/xapi bridge | `xapi/xgui.cpp` | Graphics/window xapi syscall layer. |
+| GUI/xapi bridge | `syscall.cpp` (GUI XAPI cases) | No graphics module/hook exists; GUI XAPI returns `-ENOSYS`. |
+| Optional personality hooks | **not implemented** | See root `AGENTS.md` → “OPTIONAL PERSONALITY MODULES + SYSCALL HOOKS”. |
 | Signal behavior | `signal.cpp`, `include/syscall/signal.h` | User signal delivery/handling. |
 | ABI headers | `include/syscall/`, `user/xapi/include/` | Kernel/user contract. |
 
@@ -18,7 +19,8 @@ Kernel/user boundary implementation. This subtree wires syscall entry, dispatch,
 - User pointers must be copied via current process page-directory aware helpers/bounce buffers, not blindly dereferenced.
 - Error returns generally cross from kernel/VFS errors into user-visible xapi/POSIX-like codes; preserve existing conventions per handler family.
 - File-related syscalls are tightly coupled to `driver/fs/vfs` and process file descriptor state.
-- GUI syscalls bridge to `graphics/` kernel objects; user apps should not reach kernel graphics structs directly.
+- GUI XAPI cases currently return `-ENOSYS`; there is no `graphics.sys` and no syscall personality hook yet.
+- Do not add a per-module `case` to `syscall.cpp`. Optional personalities must wait for a versioned syscall-hook ABI (see root `AGENTS.md`).
 - Keep `user/xapi/include` declarations synchronized with kernel syscall signatures/semantics.
 
 ## ANTI-PATTERNS

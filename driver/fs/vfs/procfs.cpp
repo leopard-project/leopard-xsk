@@ -2,6 +2,7 @@
 #include <procfs.h>
 #include <efi/boot.h>
 #include <errno.h>
+#include <pty.h>
 #include <task/pcb.h>
 #include <task/scheduler.h>
 #include <fs/vfs/vfs.h>
@@ -511,6 +512,11 @@ char *proc_gen_stat_file(pcb_t task, size_t *content_len) {
     int priority = task->task_level == TASK_KERNEL_LEVEL ? 5 : 6;
     size_t num_threads = task->thread_queue ? task->thread_queue->size : 0;
 
+    // Foreground pgrp of the controlling pty for this session, when one is
+    // attached. Without a controlling terminal it defaults to the task's pgrp.
+    int tpgid = pty_session_foreground_pgid(task->sid);
+    if (tpgid <= 0) tpgid = (int)task->pgid;
+
     char *buffer = (char*)malloc(PAGE_SIZE * 4);
     int   len    = sprintf(buffer,
                            "%d (%s) %c %d %d %d %d %d %u %lu %lu %lu %lu %lu %lu %ld %ld %ld %ld "
@@ -520,10 +526,10 @@ char *proc_gen_stat_file(pcb_t task, size_t *content_len) {
                            task->name, // name
                            proc_task_state(task),                        // state
                            task->parent_task ? (int)task->parent_task->pid : 0, // ppid
-                           (int)task->pid,                              // pgrp
-                           task->parent_task ? (int)task->parent_task->pid : (int)task->pid, // session
+                           (int)task->pgid,                              // pgrp
+                           (int)task->sid,                               // session
                            0,                                            // tty_nr
-                           (int)task->pid,                              // tpgid
+                           tpgid,                                        // tpgid
                            flags,                                        // flags
                            0,                                            // minflt
                            0,                                            // cminflt
@@ -768,7 +774,7 @@ char *proc_gen_cpuinfo(size_t *content_len)
 }
 
 errno_t procfs_mount(const char *src, vfs_node_t node) {
-    if (src != (void *)PROC_REGISTER_ID) return VFS_STATUS_FAILED;
+    (void)src; // vfs_mount_virtual() 已按注册 ID 选中本文件系统
     procfs_root = node;
 
     procfs_root->fsid = procfs_id;
@@ -1212,13 +1218,19 @@ static struct vfs_callback procfs_callbacks = {
 
 void procfs_setup() {
     procfs_id    = vfs_regist("proc", &procfs_callbacks, PROC_REGISTER_ID, 0x9fa0);
-    proc_self_id = vfs_regist("proc_self", &procfs_self_callbacks, PROC_REGISTER_ID, 0x0);
-    vfs_node_t proot;
-    vfs_mkdir("/proc");
-    proot=vfs_open("/proc");
-    procfs_mount((const char*)PROC_REGISTER_ID,proot);
+    proc_self_id = vfs_regist("proc_self", &procfs_self_callbacks, VFS_REGISTER_INTERNAL, 0x0);
     if (procfs_id == VFS_STATUS_FAILED || proc_self_id == VFS_STATUS_FAILED) {
         write_serial_fmt("procfs register error\n");
+        return;
+    }
+    vfs_mkdir("/proc");
+    vfs_node_t proot = vfs_open("/proc");
+    if (proot == NULL) {
+        write_serial_fmt("procfs: open /proc failed\n");
+        return;
+    }
+    if (vfs_mount_virtual(PROC_REGISTER_ID, proot) == VFS_STATUS_FAILED) {
+        write_serial_fmt("procfs: mount failed\n");
     }
 }
 

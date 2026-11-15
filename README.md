@@ -33,8 +33,8 @@ OpenXSKernel 是从 OpenXJ380 抽取出来的**纯内核**（kernel-only）仓�
   依赖的 POSIX-ish 接口。
 - **XAPI 遗留应用接口**：GUI 子集（窗口/绘制/按钮/滚动条/输入框等）已 stub 成
   `-ENOSYS`（syscall 号保留、实现移除）；非 GUI 的 XAPI（时间/睡眠/电源/进程列表等）保留。
-- PID1 解耦：内核从 `BootConfig.init`（boot.conf）读 PID1 路径，不再硬编码 shell 路径。
-- live 环境支持：`BOOT_FLAG_LIVE_ROOT` 时把 XJPAK10 live root 解包进 tmpfs 作为根文件系统。
+- PID1 解耦：内核从 `BOOT_CONFIG.cmdline`（boot.conf 的 `init=`）读 PID1 路径，不再硬编码 shell 路径。
+- initrd 支持：`BOOT_FLAG_INITRD` 时把 XJPAK10 initrd 解包进 tmpfs 作为根文件系统；live/installer 归用户态。
 
 ## 目录结构
 

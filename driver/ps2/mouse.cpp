@@ -121,7 +121,7 @@ extern "C" void mouse_inject_report(int dx, int dy, uint8_t buttons, int wheel)
 {
 #if OPENXJ380_INPUT_OUTPUT_DISABLED
     OpenXJ380MouseInterruptInfo event = {};
-    event.source = OPENXJ380_INPUT_SOURCE_USB;
+    event.source = OPENXJ380_X3TP_SOURCE_USB;
     event.route = OPENXJ380_INPUT_ROUTE_XJ380_USB;
     event.packet_complete = 1;
     event.buttons = buttons;
@@ -132,7 +132,7 @@ extern "C" void mouse_inject_report(int dx, int dy, uint8_t buttons, int wheel)
 #else
     mouse_apply_report(dx, dy, buttons, wheel, &g_usb_mouse_buttons);
     OpenXJ380MouseInterruptInfo event = {};
-    event.source = OPENXJ380_INPUT_SOURCE_USB;
+    event.source = OPENXJ380_X3TP_SOURCE_USB;
     event.packet_complete = 1;
     event.buttons = g_mouse.buttons;
     event.delta_x = (int16_t)dx;
@@ -150,7 +150,7 @@ extern "C" void c_mouse_handler(void *regs_ptr, uint64_t error_code)
     OpenXJ380MouseInterruptInfo event = {};
     event.regs = regs_ptr;
     event.error_code = error_code;
-    event.source = OPENXJ380_INPUT_SOURCE_PS2;
+    event.source = OPENXJ380_X3TP_SOURCE_PS2;
     event.route = OPENXJ380_INPUT_ROUTE_XJ380_PS2_IRQ;
     if (!OpenXJ380Socket_MouseInterrupte(&event))
     {
@@ -169,7 +169,7 @@ extern "C" void c_mouse_handler(void *regs_ptr, uint64_t error_code)
     OpenXJ380MouseInterruptInfo event = {};
     event.regs = regs_ptr;
     event.error_code = error_code;
-    event.source = OPENXJ380_INPUT_SOURCE_PS2;
+    event.source = OPENXJ380_X3TP_SOURCE_PS2;
     event.packet_byte = packet_byte;
     event.packet_complete = packet_complete ? 1 : 0;
     event.buttons = g_mouse.buttons;

@@ -6,31 +6,34 @@
 #define ALL_IMPLEMENTATION
 
 #include "fs/vfs/vfs.h"
+#include <abi/posix.h>
 #include <dlinker.h>
 #include "errno.h"
-// #include "iso9660.h"
 #include "krlibc.h"
 #include "fs/vfs/list.h"
 #include "llist.h"
 #include "pipe.h"
-#include "rtc.h"
 #include "task/pcb.h"
-#include <ioctl.h>
 #include <cpu/lock.h>
-// #include "pipefs.h"
 #include <syscall/syscall.h>
-#include <device.h>
 #include <task/poll.h>
-#include <rng.h>
+#include <user/user.h>
 
 vfs_node_t rootdir = NULL;
 
-// 通用 VFS 策略钩子（内核权限层 + 内核态模块，如 IME 文件保护）。
+// 通用 VFS 策略钩子（权限层、审计或沙箱模块）。
 // 空链 = 无策略，默认放行；任一钩子拒绝即拒绝。
 static constexpr int VFS_ACCESS_HOOK_MAX = 4;
 static vfs_access_hook_t         g_vfs_access_hooks[VFS_ACCESS_HOOK_MAX];
 static int                       g_vfs_access_hook_count = 0;
-static vfs_resolved_name_hook_t  g_vfs_resolved_name_hook = NULL;
+
+// Installed by the terminal layer (pty.cpp); NULL keeps the static /dev/tty.
+static vfs_ctty_resolver_t       g_vfs_ctty_resolver = NULL;
+
+void vfs_set_ctty_resolver(vfs_ctty_resolver_t resolver)
+{
+    g_vfs_ctty_resolver = resolver;
+}
 
 void vfs_set_access_hook(vfs_access_hook_t fn)
 {
@@ -50,11 +53,6 @@ bool vfs_add_access_hook(vfs_access_hook_t fn)
     return true;
 }
 
-void vfs_set_resolved_name_hook(vfs_resolved_name_hook_t fn)
-{
-    g_vfs_resolved_name_hook = fn;
-}
-
 bool vfs_access_allowed(vfs_node_t node, const char *path, vfs_access_op_t op)
 {
     for (int i = 0; i < g_vfs_access_hook_count; ++i)
@@ -65,15 +63,77 @@ bool vfs_access_allowed(vfs_node_t node, const char *path, vfs_access_op_t op)
     return true;
 }
 
-void vfs_notify_resolved_name(vfs_node_t node, const char *name)
+int vfs_last_error()
 {
-    if (g_vfs_resolved_name_hook != NULL) g_vfs_resolved_name_hook(node, name);
+    tcb_t task = get_current_task();
+    int error = task != NULL ? task->file_access_error : 0;
+    return error != 0 ? error : EIO;
 }
 
-tty_t *defualt_tty = NULL;
-int    tty_mode = KD_TEXT;
-int    tty_kbmode = K_XLATE;
-struct vt_mode current_vt_mode = {0};
+void vfs_clear_access_error()
+{
+    tcb_t task = get_current_task();
+    if (task != NULL) task->file_access_error = 0;
+}
+
+void vfs_set_access_error(int error)
+{
+    tcb_t task = get_current_task();
+    if (task != NULL) task->file_access_error = error;
+}
+
+bool vfs_check_access(vfs_node_t node, const char *path, int operation)
+{
+    vfs_clear_access_error();
+    if (!vfs_access_allowed(node, path, (vfs_access_op_t)operation))
+    {
+        tcb_t task = get_current_task();
+        if (task != NULL && task->file_access_error == 0) task->file_access_error = EACCES;
+        return false;
+    }
+    return true;
+}
+
+bool vfs_check_child_creation(vfs_node_t parent, const char *name)
+{
+    if (parent == NULL || name == NULL || name[0] == '\0')
+    {
+        vfs_set_access_error(EINVAL);
+        return false;
+    }
+
+    /* DAC: creating a directory entry requires search (x) and write (w) on
+       the parent directory, never permissions on the not-yet-existing child. */
+    if (!vfs_check_access(parent, NULL, VFS_ACCESS_WRITE) ||
+        !vfs_check_access(parent, NULL, VFS_ACCESS_EXEC))
+        return false;
+
+    char *base = vfs_get_fullpath(parent);
+    if (base == NULL)
+    {
+        vfs_set_access_error(ENOMEM);
+        return false;
+    }
+
+    size_t capacity = strlen(base) + strlen(name) + 2;
+    char *path = (char *)malloc(capacity);
+    if (path == NULL)
+    {
+        free(base);
+        vfs_set_access_error(ENOMEM);
+        return false;
+    }
+    snprintf(path, capacity, "%s/%s", base, name);
+
+    char *canonical = normalize_path(path);
+    bool allowed = canonical != NULL && vfs_check_access(NULL, canonical, VFS_ACCESS_WRITE);
+    if (canonical == NULL) vfs_set_access_error(ENOMEM);
+
+    free(canonical);
+    free(path);
+    free(base);
+    return allowed;
+}
 
 static void empty_func() {}
 
@@ -84,25 +144,41 @@ vfs_callback_t fs_callbacks[256] = {
     [0] = &vfs_empty_callback,
 };
 
-extern void p_xapi_output_kernel(const char *str);
-
 struct llist_header fs_metadata_list;
 
 static int fs_nextid = 1;
 static spin_t vfs_child_list_lock = SPIN_INIT;
 
-#define VFS_ALIAS_MAX 256
-
-typedef struct
-{
-    char *alias_path;
-    char *target_path;
-} vfs_alias_entry_t;//就这样吧
-
-static vfs_alias_entry_t vfs_aliases[VFS_ALIAS_MAX];
-static spin_t vfs_alias_lock = SPIN_INIT;
-
 #define callbackof(node, _name_) (fs_callbacks[(node)->fsid]->_name_)
+
+errno_t vfs_chmod(vfs_node_t node, uint32_t mode)
+{
+    if (node == NULL) return -EINVAL;
+    vfs_callback_t callback = fs_callbacks[node->fsid];
+    if (callback != NULL && callback->chmod != NULL)
+    {
+        int error = callback->chmod(node, (uint16_t)(mode & 07777));
+        if (error < 0) return error;
+    }
+    vfs_node_set_mode(node, mode);
+    return EOK;
+}
+
+errno_t vfs_chown(vfs_node_t node, uint32_t uid, uint32_t gid)
+{
+    if (node == NULL) return -EINVAL;
+    uint32_t owner = uid == 0xFFFFFFFFu ? node->owner : uid;
+    uint32_t group = gid == 0xFFFFFFFFu ? node->group : gid;
+    vfs_callback_t callback = fs_callbacks[node->fsid];
+    if (callback != NULL && callback->chown != NULL)
+    {
+        int error = callback->chown(node, owner, group);
+        if (error < 0) return error;
+    }
+    node->owner = owner;
+    node->group = group;
+    return EOK;
+}
 
 void vfs_child_lock() {
     spin_lock(&vfs_child_list_lock);
@@ -167,11 +243,24 @@ static inline void do_update(vfs_node_t file) {
         do_open(file);
 }
 
-vfs_filesystem_t get_filesystem(char *type) {
+vfs_filesystem_t get_filesystem(const char *type) {
+    if (type == NULL) return NULL;
     vfs_filesystem_t filesystem = NULL;
     vfs_filesystem_t pos, n;
     llist_for_each(pos, n, &fs_metadata_list, node) {
         if (strcmp(pos->name, type) == 0) { filesystem = pos; }
+    }
+    return filesystem;
+}
+
+/* 注册 ID 0 保留给按设备探测的文件系统（ext4/fatfs）；虚拟文件系统
+   使用各 *_REGISTER_ID 定义的非 0 ID；负数表示不可挂载的内部回调。 */
+static vfs_filesystem_t get_filesystem_by_id(int register_id) {
+    if (register_id <= 0) return NULL;
+    vfs_filesystem_t filesystem = NULL;
+    vfs_filesystem_t pos, n;
+    llist_for_each(pos, n, &fs_metadata_list, node) {
+        if (pos->id == register_id) { filesystem = pos; }
     }
     return filesystem;
 }
@@ -215,71 +304,28 @@ static vfs_node_t vfs_child_find_and_ref(vfs_node_t parent, const char *name)
     return child;
 }
 
-errno_t vfs_register_alias(const char *alias_path, const char *target_path)
+/* 新节点的默认 DAC 属性：owner = 当前身份，group = 父目录 setgid 或当前身份，
+   mode = 0777/0666 & ~umask。文件系统 callback 负责把这些值写进持久 inode。 */
+static void vfs_prepare_new_node(vfs_node_t node, bool is_dir)
 {
-    if (alias_path == NULL || target_path == NULL) return VFS_STATUS_FAILED;
-    if (alias_path[0] != '/' || target_path[0] != '/') return VFS_STATUS_FAILED;
+    if (node == NULL) return;
 
-    spin_lock(&vfs_alias_lock);
-    for (size_t i = 0; i < VFS_ALIAS_MAX; i++)
-    {
-        if (vfs_aliases[i].alias_path != NULL && streq(vfs_aliases[i].alias_path, alias_path))
-        {
-            char *new_target = strdup(target_path);
-            if (new_target == NULL)
-            {
-                spin_unlock(&vfs_alias_lock);
-                return VFS_STATUS_FAILED;
-            }
-            free(vfs_aliases[i].target_path);
-            vfs_aliases[i].target_path = new_target;
-            spin_unlock(&vfs_alias_lock);
-            return EOK;
-        }
-    }
+    UserInfo *user = task_effective_user();
+    uint32_t uid = user_uid(user);
+    uint32_t gid = user_gid(user);
+    uint32_t umask = 022;
 
-    for (size_t i = 0; i < VFS_ALIAS_MAX; i++)
-    {
-        if (vfs_aliases[i].alias_path == NULL)
-        {
-            vfs_aliases[i].alias_path = strdup(alias_path);
-            vfs_aliases[i].target_path = strdup(target_path);
-            if (vfs_aliases[i].alias_path == NULL || vfs_aliases[i].target_path == NULL)
-            {
-                free(vfs_aliases[i].alias_path);
-                free(vfs_aliases[i].target_path);
-                vfs_aliases[i].alias_path = NULL;
-                vfs_aliases[i].target_path = NULL;
-                spin_unlock(&vfs_alias_lock);
-                return VFS_STATUS_FAILED;
-            }
-            spin_unlock(&vfs_alias_lock);
-            return EOK;
-        }
-    }
+    tcb_t task = get_current_task();
+    if (task != NULL && task->parent_group != NULL) umask = task->parent_group->umask & 0777;
+    if (node->parent != NULL && (vfs_node_mode(node->parent) & 02000)) gid = node->parent->group;
 
-    spin_unlock(&vfs_alias_lock);
-    return VFS_STATUS_FAILED;
-}
-
-static char *vfs_alias_target_dup(const char *path)
-{
-    char *target = NULL;
-    spin_lock(&vfs_alias_lock);
-    for (size_t i = 0; i < VFS_ALIAS_MAX; i++)
-    {
-        if (vfs_aliases[i].alias_path != NULL && streq(vfs_aliases[i].alias_path, path))
-        {
-            target = strdup(vfs_aliases[i].target_path);
-            break;
-        }
-    }
-    spin_unlock(&vfs_alias_lock);
-    return target;
+    node->owner = uid;
+    node->group = gid;
+    vfs_node_set_mode(node, (is_dir ? 0777u : 0666u) & ~umask);
 }
 
 errno_t vfs_mkdir(const char *name) {
-    if (!vfs_access_allowed(NULL, name, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(NULL, name, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
     if (name[0] != '/') return VFS_STATUS_FAILED;
     char      *path     = strdup(name + 1);
     char      *save_ptr = path;
@@ -299,8 +345,10 @@ errno_t vfs_mkdir(const char *name) {
 
     upd:
         if (current == NULL) {
+            if (!vfs_check_child_creation(father, buf)) goto err;
             current       = vfs_node_alloc(father, buf);
             current->type = file_dir;
+            vfs_prepare_new_node(current, true);
             callbackof(father, mkdir)(father->handle, buf, current);
             do_update(current);
         } else {
@@ -318,8 +366,8 @@ err:
 }
 
 errno_t vfs_link(const char *name, const char *target_name) {
-    if (!vfs_access_allowed(NULL, name, VFS_ACCESS_WRITE) ||
-        !vfs_access_allowed(NULL, target_name, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(NULL, name, VFS_ACCESS_WRITE) ||
+        !vfs_check_access(NULL, target_name, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
     vfs_node_t current = rootdir;
     char      *path    = strdup(name + 1);
 
@@ -349,6 +397,7 @@ errno_t vfs_link(const char *name, const char *target_name) {
         if (new_current == NULL) {
             new_current       = vfs_node_alloc(current, buf);
             new_current->type = file_dir;
+            vfs_prepare_new_node(new_current, true);
             callbackof(current, mkdir)(current->handle, buf, new_current);
         }
         current = new_current;
@@ -358,8 +407,10 @@ errno_t vfs_link(const char *name, const char *target_name) {
     }
 
 create:
+    if (!vfs_check_child_creation(current, filename)) goto err;
     node = vfs_child_append(current, filename, NULL);
     node->type      = file_none;
+    vfs_prepare_new_node(node, false);
     callbackof(current, link)(current->handle, target_name, node);
     node->linkto = vfs_open(target_name);
 
@@ -373,8 +424,8 @@ err:
 }
 
 errno_t vfs_symlink(const char *name, const char *target_name) {
-    if (!vfs_access_allowed(NULL, name, VFS_ACCESS_WRITE) ||
-        !vfs_access_allowed(NULL, target_name, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(NULL, name, VFS_ACCESS_WRITE) ||
+        !vfs_check_access(NULL, target_name, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
     vfs_node_t current = rootdir;
     char      *path    = strdup(name + 1);
 
@@ -404,6 +455,7 @@ errno_t vfs_symlink(const char *name, const char *target_name) {
         if (new_current == NULL) {
             new_current       = vfs_node_alloc(current, buf);
             new_current->type = file_dir;
+            vfs_prepare_new_node(new_current, true);
             callbackof(current, mkdir)(current->handle, buf, new_current);
         }
         current = new_current;
@@ -413,8 +465,11 @@ errno_t vfs_symlink(const char *name, const char *target_name) {
     }
 
 create:
+    if (!vfs_check_child_creation(current, filename)) goto err;
     node = vfs_child_append(current, filename, NULL);
     node->type      = file_symlink;
+    vfs_prepare_new_node(node, false);
+    vfs_node_set_mode(node, 0777);
     node->linkname  = strdup(target_name);
     node->size      = node->linkname != NULL ? strlen(node->linkname) : 0;
     callbackof(current, symlink)(current->handle, target_name, node);
@@ -430,7 +485,7 @@ err:
 }
 
 errno_t vfs_mkfile(const char *name) {
-    if (!vfs_access_allowed(NULL, name, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(NULL, name, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
     if (name[0] != '/') return VFS_STATUS_FAILED;
 
     // 分离路径和文件名
@@ -456,21 +511,40 @@ errno_t vfs_mkfile(const char *name) {
     }
 
     if (parent == NULL || parent->type != file_dir) { return VFS_STATUS_FAILED; }
+    if (!vfs_check_child_creation(parent, filename)) { free(fullpath); return VFS_STATUS_FAILED; }
 
     // 创建文件
     vfs_node_t node = vfs_child_append(parent, filename, NULL);
     node->type      = file_none;
+    vfs_prepare_new_node(node, false);
     errno_t status  = callbackof(parent, mkfile)(parent->handle, filename, node);
     free(fullpath);
     return status;
 }
 
+/* sticky 目录：只有 Root、目录 owner 或文件 owner 能删除/改名。 */
+static bool vfs_sticky_allows(vfs_node_t parent, vfs_node_t victim)
+{
+    if (parent == NULL || victim == NULL) return false;
+    if ((vfs_node_mode(parent) & 01000) == 0) return true;
+    uint32_t uid = user_uid(task_effective_user());
+    return uid == 0 || uid == parent->owner || uid == victim->owner;
+}
+
 errno_t vfs_delete(vfs_node_t node) {
-    if (!vfs_access_allowed(node, NULL, VFS_ACCESS_REMOVE)) return VFS_STATUS_FAILED;
-    if (node == NULL || node == rootdir) return VFS_STATUS_FAILED;
+    if (node == NULL || node == rootdir || node->parent == NULL) return VFS_STATUS_FAILED;
+    vfs_node_t parent = node->parent;
+
+    /* Unix 语义：删除取决于父目录的 w|x，而不是文件自身 mode。 */
+    if (!vfs_check_access(parent, NULL, VFS_ACCESS_WRITE) ||
+        !vfs_check_access(parent, NULL, VFS_ACCESS_EXEC) ||
+        !vfs_sticky_allows(parent, node))
+    {
+        vfs_set_access_error(EACCES);
+        return VFS_STATUS_FAILED;
+    }
 
     vfs_child_lock();
-    vfs_node_t parent = node->parent;
     if (parent == NULL || (node->type & file_delete) ||
         ((node->type & file_dir) && node->child != NULL))
     {
@@ -528,88 +602,116 @@ errno_t vfs_delete(vfs_node_t node) {
 }
 
 errno_t vfs_rename(vfs_node_t node, const char *nw) {
-    if (!vfs_access_allowed(node, NULL, VFS_ACCESS_REMOVE) ||
-        !vfs_access_allowed(NULL, nw, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
-    if (node == NULL || nw == NULL) return VFS_STATUS_FAILED;
+    if (node == NULL || nw == NULL || node->parent == NULL) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(node->parent, NULL, VFS_ACCESS_WRITE) ||
+        !vfs_check_access(node->parent, NULL, VFS_ACCESS_EXEC) ||
+        !vfs_sticky_allows(node->parent, node) ||
+        !vfs_check_access(NULL, nw, VFS_ACCESS_WRITE))
+    {
+        vfs_set_access_error(EACCES);
+        return VFS_STATUS_FAILED;
+    }
+
+    // 把目标路径拆成"父目录 + 末级名字"，让新增子项的权限检查落在真正的目标父目录上。
+    const char *leaf = strrchr(nw, '/');
+    leaf             = leaf != NULL ? leaf + 1 : nw;
+    if (*leaf == '\0')
+    {
+        vfs_set_access_error(EINVAL);
+        return VFS_STATUS_FAILED;
+    }
+
+    char *dest_parent_path = strdup(nw);
+    if (dest_parent_path == NULL)
+    {
+        vfs_set_access_error(ENOMEM);
+        return VFS_STATUS_FAILED;
+    }
+    char *dest_slash = strrchr(dest_parent_path, '/');
+    if (dest_slash == dest_parent_path)
+    {
+        dest_parent_path[1] = '\0'; // "/name" -> "/"
+    }
+    else if (dest_slash != NULL)
+    {
+        *dest_slash = '\0';
+    }
+    else
+    {
+        strcpy(dest_parent_path, "."); // "name" -> 当前父目录
+    }
+
+    char *leaf_copy = strdup(leaf);
+    if (leaf_copy == NULL)
+    {
+        free(dest_parent_path);
+        vfs_set_access_error(ENOMEM);
+        return VFS_STATUS_FAILED;
+    }
+
+    // 没有父目录部分的相对名字沿用旧语义：相对当前节点所在的父目录。
+    bool       use_node_parent   = streq(dest_parent_path, ".");
+    vfs_node_t dest_parent       = use_node_parent ? node->parent : vfs_open(dest_parent_path);
+    bool       dest_parent_owned = !use_node_parent;
+    free(dest_parent_path);
+
+    if (dest_parent == NULL || !(dest_parent->type & file_dir) ||
+        !vfs_check_child_creation(dest_parent, leaf_copy))
+    {
+        if (dest_parent_owned) vfs_close(dest_parent);
+        free(leaf_copy);
+        return VFS_STATUS_FAILED;
+    }
+
     if ((node->type & file_symlink) && node->linkname != NULL)
     {
-        char *new_name = strrchr(nw, '/');
-        new_name = new_name != NULL ? new_name + 1 : (char *)nw;
-        if (*new_name == '\0') return VFS_STATUS_FAILED;
-        char *copy = strdup(new_name);
-        if (copy == NULL) return VFS_STATUS_FAILED;
-
-        char *parent_path = strdup(nw);
-        if (parent_path == NULL)
-        {
-            free(copy);
-            return VFS_STATUS_FAILED;
-        }
-        char *last_slash = strrchr(parent_path, '/');
-        if (last_slash == parent_path)
-        {
-            parent_path[1] = '\0';
-        }
-        else if (last_slash != NULL)
-        {
-            *last_slash = '\0';
-        }
-        else
-        {
-            strcpy(parent_path, ".");
-        }
-
-        vfs_node_t new_parent = streq(parent_path, ".") ? node->parent : vfs_open(parent_path);
-        free(parent_path);
-        if (new_parent == NULL || !(new_parent->type & file_dir))
-        {
-            if (new_parent != NULL && new_parent != node->parent) vfs_close(new_parent);
-            free(copy);
-            return VFS_STATUS_FAILED;
-        }
-
-        if (new_parent != node->parent)
+        bool moved = dest_parent != node->parent;
+        if (moved)
         {
             vfs_child_lock();
             node->parent->child = list_delete(node->parent->child, node);
-            new_parent->child = list_prepend(new_parent->child, node);
-            node->parent = new_parent;
-            node->fsid = new_parent->fsid;
-            node->root = new_parent->root;
-            node->dev = new_parent->dev;
+            dest_parent->child = list_prepend(dest_parent->child, node);
+            node->parent = dest_parent;
+            node->fsid = dest_parent->fsid;
+            node->root = dest_parent->root;
+            node->dev = dest_parent->dev;
             vfs_child_unlock();
         }
 
         free(node->name);
-        node->name = copy;
+        node->name = leaf_copy;
+        if (dest_parent_owned) vfs_close(dest_parent);
         return VFS_STATUS_SUCCESS;
     }
+
+    free(leaf_copy);
     do_update(node);
-    if (node->handle == NULL) return VFS_STATUS_FAILED;
-    return callbackof(node, rename)(node->handle, nw);
+    if (node->handle == NULL)
+    {
+        if (dest_parent_owned) vfs_close(dest_parent);
+        return VFS_STATUS_FAILED;
+    }
+    errno_t result = callbackof(node, rename)(node->handle, nw);
+    if (dest_parent_owned) vfs_close(dest_parent);
+    return result;
 }
 
 errno_t vfs_resize(vfs_node_t node, uint64_t size) {
-    if (!vfs_access_allowed(node, NULL, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(node, NULL, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
     if (node == NULL) return VFS_STATUS_FAILED;
     do_update(node);
     if (node->type == file_dir) return VFS_STATUS_FAILED;
     callbackof(node, resize)(node->handle, size);
     do_update(node);
-    return VFS_STATUS_SUCCESS;
-}
-
-errno_t vfs_resize_fast(vfs_node_t node, uint64_t size) {
-    if (!vfs_access_allowed(node, NULL, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
-    if (node == NULL) return VFS_STATUS_FAILED;
-    if (node->type == file_dir) return VFS_STATUS_FAILED;
-    callbackof(node, resize)(node->handle, size);
     return VFS_STATUS_SUCCESS;
 }
 
 int vfs_regist(const char *name, vfs_callback_t callback, int register_id, uint64_t magic) {
     if (callback == NULL) return VFS_STATUS_FAILED;
-    for (size_t i = 0; i < sizeof(struct vfs_callback) / sizeof(void *); i++) {
+    /* chmod/chown are optional persistence hooks; every other slot is
+       mandatory so dispatch never hits a NULL function pointer. */
+    size_t required = offsetof(struct vfs_callback, chmod) / sizeof(void *);
+    for (size_t i = 0; i < required; i++) {
         if (((void **)callback)[i] == NULL) return VFS_STATUS_FAILED;
     }
     int id           = fs_nextid++;
@@ -638,11 +740,19 @@ vfs_node_t vfs_do_search(vfs_node_t dir, const char *name) {
 
 static constexpr unsigned VFS_MAX_LINK_DEPTH = 40;
 
-static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool allow_alias, unsigned link_depth) {
+static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, unsigned link_depth) {
     if (unlikely(str == NULL)) return NULL;
     if (unlikely(str[0] != '/')) return NULL;
     if (unlikely(link_depth > VFS_MAX_LINK_DEPTH)) return NULL;
     if (str[1] == '\0') return rootdir; // 根目录
+
+    // "/dev/tty" follows the caller's controlling PTY when one is attached.
+    // The resolver returns a referenced node or NULL for the static devfs tty.
+    if (g_vfs_ctty_resolver != NULL && streq(str, "/dev/tty"))
+    {
+        vfs_node_t ctty = g_vfs_ctty_resolver();
+        if (ctty != NULL) return ctty;
+    }
 
     char *path = strdup(str + 1);
     if (unlikely(path == NULL)) return NULL;
@@ -685,7 +795,7 @@ static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool
                 target_path[len] = '\0';
                 if (target_path[0] == '/')
                 {
-                    target = vfs_open_impl(target_path, true, true, link_depth + 1);
+                    target = vfs_open_impl(target_path, true, link_depth + 1);
                 }
                 else
                 {
@@ -705,7 +815,7 @@ static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool
                     free(joined_target);
                     free(parent_path);
                     if (full_target == NULL) goto err;
-                    target = vfs_open_impl(full_target, true, true, link_depth + 1);
+                    target = vfs_open_impl(full_target, true, link_depth + 1);
                     free(full_target);
                 }
                 if (!dynamic_symlink) current->linkto = target;
@@ -744,36 +854,25 @@ static vfs_node_t vfs_open_impl(const char *str, bool follow_final_symlink, bool
 err:
     free(path);
     if (acquired_current != NULL) vfs_close(acquired_current);
-    if (allow_alias) {
-        char *alias_target = vfs_alias_target_dup(str);
-        if (alias_target != NULL) {
-            write_serial_fmt("[busybox-debug] vfs_alias_hit %s -> %s\n", str, alias_target);
-            vfs_node_t alias_node = vfs_open_impl(alias_target, follow_final_symlink, false, link_depth + 1);
-            free(alias_target);
-            return alias_node;
-        }
-    }
     return NULL;
 }
 
 vfs_node_t vfs_open(const char *str) {
-    vfs_node_t node = vfs_open_impl(str, true, true, 0);
-    if (node && !vfs_access_allowed(node, NULL, VFS_ACCESS_READ)) { vfs_close(node); return NULL; }
+    vfs_clear_access_error();
+    vfs_node_t node = vfs_open_impl(str, true, 0);
+    if (node && !vfs_check_access(node, NULL, VFS_ACCESS_READ)) { vfs_close(node); return NULL; }
     return node;
 }
 
 vfs_node_t vfs_open_no_follow(const char *str) {
-    vfs_node_t node = vfs_open_impl(str, false, true, 0);
-    if (node && !vfs_access_allowed(node, NULL, VFS_ACCESS_READ)) { vfs_close(node); return NULL; }
+    vfs_clear_access_error();
+    vfs_node_t node = vfs_open_impl(str, false, 0);
+    if (node && !vfs_check_access(node, NULL, VFS_ACCESS_READ)) { vfs_close(node); return NULL; }
     return node;
 }
 
 void vfs_update(vfs_node_t node) {
     do_update(node);
-}
-
-void vfs_deinit() {
-    // 目前并不支持
 }
 
 fd_file_handle *fd_dup(fd_file_handle *src) {
@@ -819,7 +918,9 @@ void *vfs_map(vfs_node_t node, uint64_t addr, uint64_t len, uint64_t prot, uint6
               uint64_t offset) {
     if (unlikely(node == NULL)) return NULL;
     if (unlikely(node->type == file_dir)) return NULL;
-    if (!vfs_access_allowed(node, NULL, (prot & 2) ? VFS_ACCESS_WRITE : VFS_ACCESS_READ)) return NULL;
+    vfs_access_op_t access = (prot & 2) ? ((prot & 1) ? VFS_ACCESS_READ_WRITE : VFS_ACCESS_WRITE) :
+                                          VFS_ACCESS_READ;
+    if (!vfs_check_access(node, NULL, access)) return NULL;
     return callbackof(node, map)(node->handle, (void *)addr, offset, len, prot, flags);
 }
 
@@ -836,7 +937,7 @@ vfs_node_t vfs_node_alloc(vfs_node_t parent, const char *name) {
     node->dev      = parent ? parent->dev : 0;
     node->refcount = 1;
     node->blksz    = PAGE_SIZE;
-    node->mode     = 0777;
+    vfs_node_set_mode(node, 0777);
     node->linkto   = NULL;
     if (parent)
     {
@@ -976,14 +1077,6 @@ errno_t vfs_close(vfs_node_t node) {
     return VFS_STATUS_SUCCESS;
 }
 
-bool is_virtual_fs(const char *src) {
-    return ((uint64_t)src) == DEVFS_REGISTER_ID || ((uint64_t)src) == MODFS_REGISTER_ID ||
-           ((uint64_t)src) == TMPFS_REGISTER_ID || ((uint64_t)src) == PIEFS_REGISTER_ID ||
-           ((uint64_t)src) == NETFS_REGISTER_ID || ((uint64_t)src) == CPFS_REGISTER_ID ||
-           ((uint64_t)src) == PROC_REGISTER_ID || ((uint64_t)src) == DNS_REGISTER_ID ||
-           ((uint64_t)src) == NM_REGISTER_ID;
-}
-
 void vfs_free(vfs_node_t vfs) {
     if (vfs == NULL) return;
     vfs_child_lock();
@@ -1006,10 +1099,11 @@ void vfs_free_child(vfs_node_t vfs) {
     list_free_with(child, (void (*)(void *))vfs_free);
 }
 
-errno_t vfs_mount_as(vfs_filesystem_t fs, const char *src, vfs_node_t node) {
-    if (fs == NULL || fs->callback == NULL || fs->callback->mount == NULL) return VFS_STATUS_FAILED;
-    if (!vfs_access_allowed(node, NULL, VFS_ACCESS_MOUNT)) return VFS_STATUS_FAILED;
+static errno_t vfs_mount_filesystem(vfs_filesystem_t fs, const char *src, vfs_node_t node) {
+    if (fs == NULL || fs->callback == NULL || fs->callback->mount == NULL)
+        return VFS_STATUS_FAILED;
     if (node == NULL || node->type != file_dir) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(node, NULL, VFS_ACCESS_MOUNT)) return VFS_STATUS_FAILED;
     if (fs->callback->mount(src, node) != 0) return VFS_STATUS_FAILED;
     node->fsid     = fs->fsid;
     node->root     = node;
@@ -1017,13 +1111,26 @@ errno_t vfs_mount_as(vfs_filesystem_t fs, const char *src, vfs_node_t node) {
     return VFS_STATUS_SUCCESS;
 }
 
-errno_t vfs_mount(const char *src, vfs_node_t node) {
-    if (!vfs_access_allowed(node, NULL, VFS_ACCESS_MOUNT)) return VFS_STATUS_FAILED;
+errno_t vfs_mount_as(vfs_filesystem_t fs, const char *src, vfs_node_t node) {
+    return vfs_mount_filesystem(fs, src, node);
+}
+
+errno_t vfs_mount_device(const char *device, const char *type, vfs_node_t node) {
     if (node == NULL || node->type != file_dir) return VFS_STATUS_FAILED;
-    for (int i = 1; i < fs_nextid; i++) {
-        if (fs_callbacks[i] != NULL && fs_callbacks[i]->mount != NULL &&
-            fs_callbacks[i]->mount(src, node) == 0) {
-            node->fsid     = i;
+
+    if (type != NULL) return vfs_mount_filesystem(get_filesystem(type), device, node);
+
+    if (!vfs_check_access(node, NULL, VFS_ACCESS_MOUNT)) return VFS_STATUS_FAILED;
+
+    /* 自动探测只尝试设备类文件系统（注册 ID 0）。虚拟文件系统必须通过
+       vfs_mount_virtual() 按 ID 显式挂载，不能被探测命中。 */
+    vfs_filesystem_t pos, n;
+    llist_for_each(pos, n, &fs_metadata_list, node) {
+        if (pos->id != VFS_DEVICE_REGISTER_ID || pos->callback == NULL ||
+            pos->callback->mount == NULL)
+            continue;
+        if (pos->callback->mount(device, node) == 0) {
+            node->fsid     = pos->fsid;
             node->root     = node;
             node->is_mount = true;
             return VFS_STATUS_SUCCESS;
@@ -1032,8 +1139,12 @@ errno_t vfs_mount(const char *src, vfs_node_t node) {
     return VFS_STATUS_FAILED;
 }
 
+errno_t vfs_mount_virtual(int register_id, vfs_node_t node) {
+    return vfs_mount_filesystem(get_filesystem_by_id(register_id), NULL, node);
+}
+
 size_t vfs_read(vfs_node_t file, void *addr, size_t offset, size_t size) {
-    if (!vfs_access_allowed(file, NULL, VFS_ACCESS_READ)) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(file, NULL, VFS_ACCESS_READ)) return VFS_STATUS_FAILED;
     if (file == NULL || addr == NULL) return VFS_STATUS_FAILED;
     do_update(file);
     if (file->type == file_dir) return VFS_STATUS_FAILED;
@@ -1041,7 +1152,7 @@ size_t vfs_read(vfs_node_t file, void *addr, size_t offset, size_t size) {
 }
 
 size_t vfs_write(vfs_node_t file, void *addr, size_t offset, size_t size) {
-    if (!vfs_access_allowed(file, NULL, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(file, NULL, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
     if (file == NULL || addr == NULL) return VFS_STATUS_FAILED;
     do_update(file);
     if (file->type == file_dir) return VFS_STATUS_FAILED;
@@ -1050,18 +1161,34 @@ size_t vfs_write(vfs_node_t file, void *addr, size_t offset, size_t size) {
     return ret;
 }
 
-size_t vfs_write_fast(vfs_node_t file, void *addr, size_t offset, size_t size) {
-    if (!vfs_access_allowed(file, NULL, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
+size_t vfs_read_raw(vfs_node_t file, void *addr, size_t offset, size_t size) {
     if (file == NULL || addr == NULL) return VFS_STATUS_FAILED;
+    do_update(file);
     if (file->type == file_dir) return VFS_STATUS_FAILED;
-    return callbackof(file, write)(file->handle, addr, offset, size);
+    return callbackof(file, read)(file->handle, addr, offset, size);
+}
+
+size_t vfs_write_raw(vfs_node_t file, const void *addr, size_t offset, size_t size) {
+    if (file == NULL || addr == NULL) return VFS_STATUS_FAILED;
+    do_update(file);
+    if (file->type == file_dir) return VFS_STATUS_FAILED;
+    size_t ret = callbackof(file, write)(file->handle, addr, offset, size);
+    do_update(file);
+    return ret;
 }
 
 errno_t vfs_ioctl(vfs_node_t device, size_t options, void *arg) {
-    if (!vfs_access_allowed(device, NULL, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(device, NULL, VFS_ACCESS_WRITE)) return VFS_STATUS_FAILED;
     if (device == NULL) return VFS_STATUS_FAILED;
     do_update(device);
     if (device->type == file_dir) return VFS_STATUS_FAILED;
+    return callbackof(device, ioctl)(device->handle, options, arg);
+}
+
+errno_t vfs_ioctl_raw(vfs_node_t device, size_t options, void *arg) {
+    if (device == NULL) return -EINVAL;
+    do_update(device);
+    if (device->type == file_dir) return -EINVAL;
     return callbackof(device, ioctl)(device->handle, options, arg);
 }
 
@@ -1072,7 +1199,7 @@ errno_t vfs_poll(vfs_node_t node, size_t event) {
 }
 
 errno_t vfs_unmount(const char *path) {
-    if (!vfs_access_allowed(NULL, NULL, VFS_ACCESS_MOUNT)) return VFS_STATUS_FAILED;
+    if (!vfs_check_access(NULL, NULL, VFS_ACCESS_MOUNT)) return VFS_STATUS_FAILED;
     vfs_node_t node = vfs_open(path);
     if (node == NULL) return VFS_STATUS_FAILED;
     if (node->type != file_dir) return VFS_STATUS_FAILED;
@@ -1096,6 +1223,7 @@ errno_t vfs_unmount(const char *path) {
 }
 
 size_t vfs_readlink(vfs_node_t node, char *buf, size_t bufsize) {
+    if (!vfs_check_access(node, NULL, VFS_ACCESS_READ)) return VFS_STATUS_FAILED;
     if (node != NULL && node->linkname != NULL) {
         size_t link_size = strlen(node->linkname);
         size_t copy_size = MIN(link_size, bufsize);
@@ -1320,391 +1448,11 @@ bool vfs_init() {
     return true;
 }
 
-static tty_t *current_tty()
-{
-    tcb_t task = get_current_task();
-    if (task == NULL || task->parent_group == NULL || task->parent_group->tty == NULL) return get_default_tty();
-    return task->parent_group->tty;
-}
-
-static xtttp_dtt *current_xtttp_terminal()
-{
-    tcb_t task = get_current_task();
-    pcb_t process = task != NULL ? task->parent_group : NULL;
-    while (process != NULL && process != kernel_group)
-    {
-        if (process->xtttp_stc != NULL && process->xtttp_stc->is_shell) return process->xtttp_stc;
-        process = process->parent_task;
-    }
-    return NULL;
-}
-
-static void tty_kernel_flush(tty_t *tty)
-{
-    (void)tty;
-}
-
-static void tty_kernel_print(tty_t *tty, const char *msg)
-{
-    (void)tty;
-    /* p_xapi_output_kernel already routes to the XTTTP terminal when one
-     * exists, and falls back to the serial/framebuffer console otherwise.
-     * Writing serial here as well would duplicate every line on the
-     * LeopardOS serial console (there is no separate terminal app). */
-    p_xapi_output_kernel(msg);
-}
-
-static void tty_kernel_putc(tty_t *tty, int c)
-{
-    (void)tty;
-    char buf[2] = {(char)c, '\0'};
-    p_xapi_output_kernel(buf);
-}
-
-static void tty_termios_default(termios_t *termios)
-{
-    memset(termios, 0, sizeof(*termios));
-    termios->c_lflag = ECHO | ICANON | IEXTEN | ISIG;
-    termios->c_iflag = BRKINT | ICRNL | INPCK | ISTRIP | IXON;
-    termios->c_oflag = OPOST;
-    termios->c_cflag = CS8 | CREAD | CLOCAL;
-    termios->c_line = 0;
-    termios->c_cc[VINTR] = 3;
-    termios->c_cc[VQUIT] = 28;
-    termios->c_cc[VERASE] = 0x7F;
-    termios->c_cc[VKILL] = 21;
-    termios->c_cc[VEOF] = 4;
-    termios->c_cc[VTIME] = 0;
-    termios->c_cc[VMIN] = 1;
-    termios->c_cc[VSTART] = 17;
-    termios->c_cc[VSTOP] = 19;
-    termios->c_cc[VSUSP] = 26;
-    termios->c_cc[VREPRINT] = 18;
-    termios->c_cc[VDISCARD] = 15;
-    termios->c_cc[VWERASE] = 23;
-    termios->c_cc[VLNEXT] = 22;
-}
-
-tty_t *alloc_default_tty()
-{
-    tty_t *tty = (tty_t *)malloc(sizeof(tty_t));
-    if (tty == NULL) return NULL;
-    memset(tty, 0, sizeof(*tty));
-    tty->width = 720;
-    tty->height = 400;
-    tty->print = tty_kernel_print;
-    tty->putchar = tty_kernel_putc;
-    tty->flush = tty_kernel_flush;
-    tty_termios_default(&tty->termios);
-    tty->is_sigterm = false;
-    return tty;
-}
-
-void free_tty(tty_t *tty)
-{
-    if (tty == NULL || tty == defualt_tty) return;
-    free(tty);
-}
-
-tty_t *get_default_tty()
-{
-    return defualt_tty;
-}
-
-static size_t stdin_read(int drive, uint8_t *buffer, size_t number, size_t lba) {
-    bool is_sti = are_interrupts_enabled();
-    open_interrupt;
-
-    xtttp_dtt *terminal = current_xtttp_terminal();
-    if (terminal != NULL)
-    {
-        terminal->sink.wait_for_input = true;
-        while (!terminal->sink.input_lock)
-        {
-            scheduler_yield();
-        }
-    }
-
-    size_t i = 0;
-    for (; i < number; i++) {
-        char c;
-        if (terminal != NULL)
-        {
-            c = terminal->sink.input[0];
-            if (c == '\0') break;
-            size_t remaining = strlen(terminal->sink.input);
-            if (remaining > 0)
-            {
-                memmove(terminal->sink.input, terminal->sink.input + 1, remaining);
-            }
-        }
-        else
-        {
-            c = (char)get_keyboard_input();
-        }
-        if (c == '\0') { break; }
-        tty_t *tty = current_tty();
-        uint32_t lflag = tty != NULL ? tty->termios.c_lflag : 0;
-        if (c == 0x9) { c = '\t'; }
-        if (terminal == NULL && (c == 0x7f || c == '\b') && (lflag & ICANON)) {
-            if (tty != NULL && (lflag & ECHO)) write_serial_fmt("\b \b");
-            if (i > 0) {
-                i--;
-                buffer[i] = '\0';
-            }
-            continue;
-        }
-        if (tty != NULL && (lflag & ECHO)) write_serial_fmt("%c", c);
-        buffer[i] = c;
-        if (c == '\n') {
-            i++;
-            break;
-        }
-    }
-
-    if (terminal != NULL)
-    {
-        if (terminal->sink.input[0] == '\0')
-        {
-            terminal->sink.input_lock = false;
-            terminal->sink.wait_for_input = false;
-        }
-        else
-        {
-            terminal->sink.input_lock = true;
-            terminal->sink.wait_for_input = false;
-        }
-    }
-
-    if (!is_sti) close_interrupt;
-
-    pcb_t process = get_current_task() ? get_current_task()->parent_group : NULL;
-    if (process != NULL && process->linux_abi) {
-        // write_serial_fmt("[] stdin_read requested=%llu ret=%llu\n",
-        //                  (unsigned long long)number,
-        //                  (unsigned long long)i);
-    }
-
-    return i;
-}
-
-static size_t stdout_write(int drive, uint8_t *buffer, size_t number, size_t lba) {
-    tty_t *tty = current_tty();
-    if (tty != NULL && tty->print != NULL)
-    {
-        char *text = (char *)malloc(number + 1);
-        if (text == NULL) return 0;
-        memcpy(text, buffer, number);
-        text[number] = '\0';
-        tty->print(tty, text);
-        free(text);
-    }
-    else
-    {
-        for (size_t i = 0; i < number; i++) write_serial_fmt("%c", buffer[i]);
-    }
-    return number;
-}
-
-static errno_t tty_ioctl(device_t *device, size_t req, void *arg)
-{
-    (void)device;
-    tty_t *tty = current_tty();
-    if (tty == NULL) return -ENOTTY;
-
-    switch (req)
-    {
-    case TIOCGWINSZ:
-    {
-        struct winsize *ws = (struct winsize *)arg;
-        if (ws != NULL)
-        {
-            ws->ws_row = 25;
-            ws->ws_col = 80;
-            ws->ws_xpixel = (unsigned short)tty->width;
-            ws->ws_ypixel = (unsigned short)tty->height;
-        }
-        break;
-    }
-    case TCGETS:
-    {
-        struct termios *termios = (struct termios *)arg;
-        if (termios == NULL) return -EFAULT;
-        memcpy(termios, &tty->termios, sizeof(struct termios));
-        break;
-    }
-    case TCSETS:
-    case TCSETSF:
-    case TCSETSW:
-    {
-        const struct termios *termios = (const struct termios *)arg;
-        if (termios == NULL) return -EFAULT;
-        memcpy(&tty->termios, termios, sizeof(struct termios));
-        break;
-    }
-    case TIOCGPGRP:
-        if (arg == NULL) return -EFAULT;
-        *(int *)arg = get_current_task()->parent_group->pid;
-        tty->is_sigterm = true;
-        break;
-    case TIOCSPGRP:
-    case TIOCSCTTY:
-        break;
-    case KDGETMODE:
-        if (arg == NULL) return -EFAULT;
-        *(int *)arg = tty_mode;
-        break;
-    case KDSETMODE:
-        if (arg == NULL) return -EFAULT;
-        tty_mode = *(int *)arg;
-        break;
-    case KDGKBMODE:
-        if (arg == NULL) return -EFAULT;
-        *(int *)arg = tty_kbmode;
-        break;
-    case KDSKBMODE:
-        if (arg == NULL) return -EFAULT;
-        tty_kbmode = *(int *)arg;
-        break;
-    case VT_SETMODE:
-        if (arg == NULL) return -EFAULT;
-        memcpy(&current_vt_mode, arg, sizeof(current_vt_mode));
-        break;
-    case VT_GETMODE:
-        if (arg == NULL) return -EFAULT;
-        memcpy(arg, &current_vt_mode, sizeof(current_vt_mode));
-        break;
-    case VT_OPENQRY:
-        if (arg == NULL) return -EFAULT;
-        *(int *)arg = 1;
-        break;
-    default:
-        return -ENOTTY;
-    }
-    return EOK;
-}
-
-static errno_t tty_poll(size_t events)
-{
-    int revents = 0;
-    if (events & POLLIN)
-    {
-        xtttp_dtt *terminal = current_xtttp_terminal();
-        if (terminal != NULL)
-        {
-            if (terminal->sink.input[0] != '\0') revents |= POLLIN;
-        }
-        else
-        {
-            revents |= POLLIN;
-        }
-    }
-    if (events & POLLOUT) revents |= POLLOUT;
-    return revents;
-}
-
-static size_t null_read(int drive, uint8_t *buffer, size_t number, size_t lba)
-{
-    UNUSED(drive);
-    UNUSED(buffer);
-    UNUSED(lba);
-    return 0;
-}
-
-static size_t null_write(int drive, uint8_t *buffer, size_t number, size_t lba)
-{
-    UNUSED(drive);
-    UNUSED(buffer);
-    UNUSED(lba);
-    return number;
-}
-
-static size_t urandom_read(int drive, uint8_t *buffer, size_t number, size_t lba)
-{
-    UNUSED(drive);
-    UNUSED(lba);
-    if (buffer == NULL) return 0;
-
-    get_random_bytes(buffer, number);
-    return number;
-}
-
-static size_t urandom_write(int drive, uint8_t *buffer, size_t number, size_t lba)
-{
-    UNUSED(drive);
-    UNUSED(buffer);
-    UNUSED(lba);
-    return number;
-}
-
-void build_tty_device()
-{
-    device_t stdio;
-    stdio.type = DEVICE_STREAM;
-    strcpy(stdio.drive_name, "stdio");
-    stdio.flag        = 1;
-    stdio.sector_size = 1;
-    stdio.size        = 1;
-    stdio.read        = stdin_read;
-    stdio.write       = stdout_write;
-    stdio.ioctl       = tty_ioctl;
-    stdio.poll        = tty_poll;
-    stdio.map         = (mapf)empty;
-    regist_device(NULL, stdio);
-
-    device_t ttydev = stdio;
-    strcpy(ttydev.drive_name, "tty");
-    regist_device(NULL, ttydev);
-
-    device_t null_dev = {};
-    null_dev.type = DEVICE_STREAM;
-    strcpy(null_dev.drive_name, "null");
-    null_dev.flag        = 1;
-    null_dev.sector_size = 1;
-    null_dev.size        = 0;
-    null_dev.read        = null_read;
-    null_dev.write       = null_write;
-    null_dev.ioctl       = tty_ioctl;
-    null_dev.poll        = tty_poll;
-    null_dev.map         = (mapf)empty;
-    regist_device(NULL, null_dev);
-
-    device_t urandom_dev = {};
-    urandom_dev.type = DEVICE_STREAM;
-    strcpy(urandom_dev.drive_name, "urandom");
-    urandom_dev.flag        = 1;
-    urandom_dev.sector_size = 1;
-    urandom_dev.size        = (size_t)-1;
-    urandom_dev.read        = urandom_read;
-    urandom_dev.write       = urandom_write;
-    urandom_dev.ioctl       = tty_ioctl;
-    urandom_dev.poll        = tty_poll;
-    urandom_dev.map         = (mapf)empty;
-    regist_device(NULL, urandom_dev);
-}
-
-void init_tty()
-{
-    defualt_tty = alloc_default_tty();
-    build_tty_device();
-}
-
-void stdio_init()
-{
-    init_tty();
-}
-
-// 导出 VFS 原语，供 ime-kmod（.sys 模块）在加载时解析。
+// VFS 原语导出给内核态模块。最小集合：只读/读写数据路径 + 追加式策略钩子。
+// 根节点、路径规范化与创建/删除/截断原语不再导出；新增导出必须先确认
+// in-tree 模块确实需要，并评估内核攻击面。
 EXPORT_SYMBOL(vfs_open);
 EXPORT_SYMBOL(vfs_close);
 EXPORT_SYMBOL(vfs_read);
 EXPORT_SYMBOL(vfs_write);
-EXPORT_SYMBOL(vfs_resize);
-EXPORT_SYMBOL(vfs_delete);
-EXPORT_SYMBOL(vfs_mkfile);
-EXPORT_SYMBOL(vfs_mkdir);
-EXPORT_SYMBOL(normalize_path);
-EXPORT_SYMBOL_OBJECT(rootdir);
-EXPORT_SYMBOL(vfs_set_access_hook);
 EXPORT_SYMBOL(vfs_add_access_hook);
-EXPORT_SYMBOL(vfs_set_resolved_name_hook);

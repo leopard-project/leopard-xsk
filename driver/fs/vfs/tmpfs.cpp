@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fs/vfs/vfs.h>
 #include <proto.hpp>
+#include <stdint.h>
 
 typedef struct tmpfs_entry {
     vfs_node_t          node;
@@ -14,6 +15,9 @@ typedef struct tmpfs_entry {
     size_t              capacity;
     bool                is_dir;
     uint64_t            inode;
+    uint32_t            owner;
+    uint32_t            group;
+    uint16_t            mode;
 } tmpfs_entry_t;
 
 static int           tmpfs_id       = 0;
@@ -94,12 +98,22 @@ static void tmpfs_apply_stat(tmpfs_entry_t *entry, vfs_node_t node)
     node->inode = entry->inode;
     node->blksz = PAGE_SIZE;
     node->dev   = node->root != NULL ? node->root->dev : 0;
-    node->mode  = node->mode == 0 ? (entry->is_dir ? 0777 : 0666) : node->mode;
+    node->owner = entry->owner;
+    node->group = entry->group;
+    vfs_node_set_mode(node, entry->mode != 0 ? entry->mode : (entry->is_dir ? 0755 : 0644));
+}
+
+static void tmpfs_store_attrs(tmpfs_entry_t *entry, vfs_node_t node)
+{
+    if (entry == NULL || node == NULL) return;
+    entry->owner = node->owner;
+    entry->group = node->group;
+    entry->mode  = (uint16_t)vfs_node_mode(node);
 }
 
 static errno_t tmpfs_mount(const char *src, vfs_node_t node)
 {
-    if ((uint64_t)src != TMPFS_REGISTER_ID) return VFS_STATUS_FAILED;
+    (void)src; // vfs_mount_virtual() 已按注册 ID 选中本文件系统
 
     spin_lock(&tmpfs_lock);
     tmpfs_entry_t *entry = tmpfs_alloc_entry(node, NULL, node->name != NULL ? node->name : "", true);
@@ -107,11 +121,17 @@ static errno_t tmpfs_mount(const char *src, vfs_node_t node)
         spin_unlock(&tmpfs_lock);
         return VFS_STATUS_FAILED;
     }
+    entry->owner = 0;
+    entry->group = 0;
+    entry->mode  = 01777; // /tmp: sticky, world-writable
     node->handle = entry;
     node->fsid   = tmpfs_id;
     node->type   = file_dir;
     node->inode  = 1;
     node->blksz  = PAGE_SIZE;
+    node->owner  = entry->owner;
+    node->group  = entry->group;
+    vfs_node_set_mode(node, entry->mode);
     spin_unlock(&tmpfs_lock);
     return VFS_STATUS_SUCCESS;
 }
@@ -155,6 +175,7 @@ static errno_t tmpfs_mkdir(void *parent, const char *name, vfs_node_t node)
         spin_unlock(&tmpfs_lock);
         return VFS_STATUS_FAILED;
     }
+    tmpfs_store_attrs(entry, node);
     node->handle = entry;
     tmpfs_apply_stat(entry, node);
     spin_unlock(&tmpfs_lock);
@@ -174,6 +195,7 @@ static errno_t tmpfs_mkfile(void *parent, const char *name, vfs_node_t node)
         spin_unlock(&tmpfs_lock);
         return VFS_STATUS_FAILED;
     }
+    tmpfs_store_attrs(entry, node);
     node->handle = entry;
     tmpfs_apply_stat(entry, node);
     spin_unlock(&tmpfs_lock);
@@ -296,6 +318,33 @@ static errno_t tmpfs_rename(void *current, const char *nw)
     return VFS_STATUS_SUCCESS;
 }
 
+static errno_t tmpfs_chmod(vfs_node_t node, uint16_t mode)
+{
+    spin_lock(&tmpfs_lock);
+    tmpfs_entry_t *entry = tmpfs_find_by_node(node);
+    if (entry == NULL) {
+        spin_unlock(&tmpfs_lock);
+        return -EINVAL;
+    }
+    entry->mode = mode & 07777;
+    spin_unlock(&tmpfs_lock);
+    return 0;
+}
+
+static errno_t tmpfs_chown(vfs_node_t node, uint32_t uid, uint32_t gid)
+{
+    spin_lock(&tmpfs_lock);
+    tmpfs_entry_t *entry = tmpfs_find_by_node(node);
+    if (entry == NULL) {
+        spin_unlock(&tmpfs_lock);
+        return -EINVAL;
+    }
+    if (uid != 0xFFFFFFFFu) entry->owner = uid;
+    if (gid != 0xFFFFFFFFu) entry->group = gid;
+    spin_unlock(&tmpfs_lock);
+    return 0;
+}
+
 static int tmpfs_dummy()
 {
     return -ENOSYS;
@@ -338,6 +387,8 @@ static struct vfs_callback tmpfs_callbacks = {
     .resize   = tmpfs_resize,
     .del      = tmpfs_delete,
     .rename   = tmpfs_rename,
+    .chmod    = tmpfs_chmod,
+    .chown    = tmpfs_chown,
 };
 
 int tmpfs_setup(void)
@@ -348,6 +399,6 @@ int tmpfs_setup(void)
     vfs_mkdir("/tmp");
     vfs_node_t tmp = vfs_open("/tmp");
     if (tmp == NULL) return -ENOENT;
-    if (vfs_mount((const char *)TMPFS_REGISTER_ID, tmp) == VFS_STATUS_FAILED) return -EIO;
+    if (vfs_mount_virtual(TMPFS_REGISTER_ID, tmp) == VFS_STATUS_FAILED) return -EIO;
     return 0;
 }

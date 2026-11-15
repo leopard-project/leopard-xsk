@@ -1,6 +1,8 @@
 #ifndef _STDIO_H_
 #define _STDIO_H_
 
+#include <abi/posix.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -11,9 +13,6 @@ extern "C" {
 #define BIN      0x0
 #define PLUS     0x10
 #define EOF      -1
-#define SEEK_SET 0
-#define SEEK_CUR 1
-#define SEEK_END 2
 #define BUFSIZ   (4096 * 2)
 #define getchar  getch
 

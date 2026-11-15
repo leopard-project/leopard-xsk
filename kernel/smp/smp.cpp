@@ -16,7 +16,7 @@
 XSK_SMP_INFO *xsi;
 
 extern APIC_INFO ApicInfo;
-extern void     *temp_stack[MAX_CPU_NUM];
+static void    **temp_stack;
 extern uint32_t  smp_trampoline_rs;
 extern size_t    now_tid;
 
@@ -378,6 +378,30 @@ void init_smp(uint64_t MADT0)
 
     mtrr_save();
 
+    /*
+     * AP temporary stacks are kernel-owned now: the bootloader used to
+     * allocate MAX_CPU_NUM * STACK_SIZE (64 MiB at 256 CPUs) unconditionally.
+     * Allocate only for the CPUs actually present in MADT.
+     */
+    if (max_cpus == 0) max_cpus = 1;
+    if (max_cpus > MAX_CPU_NUM) max_cpus = MAX_CPU_NUM;
+    temp_stack = (void **)malloc(max_cpus * sizeof(*temp_stack));
+    if (temp_stack == NULL)
+    {
+        write_serial_string("SMP: cannot allocate AP stack table.\n");
+        while (true) asm volatile("hlt");
+    }
+    for (size_t i = 0; i < max_cpus; ++i)
+    {
+        temp_stack[i] = aligned_alloc(16, STACK_SIZE);
+        if (temp_stack[i] == NULL)
+        {
+            write_serial_fmt("SMP: cannot allocate AP stack %llu.\n", (unsigned long long)i);
+            while (true) asm volatile("hlt");
+        }
+        memset(temp_stack[i], 0, STACK_SIZE);
+    }
+
     write_serial_string("Start Up APs...\n");
     // 尝试启动所有AP
     current = 0;
@@ -394,6 +418,12 @@ void init_smp(uint64_t MADT0)
             {
                 current += (uint64_t)header->length;
                 continue;
+            }
+
+            if (xsi->cpu_count >= max_cpus)
+            {
+                pr_err("SMP: CPU limit reached, skipping remaining CPUs.\n");
+                break;
             }
 
             PROCESSOR_INFO *cpuinf  = &xsi->pcr_inf[xsi->cpu_count];
@@ -427,6 +457,12 @@ void init_smp(uint64_t MADT0)
             {
                 current += (uint64_t)header->length;
                 continue;
+            }
+
+            if (xsi->cpu_count >= max_cpus)
+            {
+                pr_err("SMP: CPU limit reached, skipping remaining CPUs.\n");
+                break;
             }
 
             PROCESSOR_INFO *cpuinf  = &xsi->pcr_inf[xsi->cpu_count];

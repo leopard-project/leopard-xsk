@@ -3,6 +3,7 @@
 #include <cpu/msr.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
+#include <abi/posix.h>
 #include <installer_protocol.h>
 #include <openxj380/syscall.h>
 #include <math.hpp>
@@ -744,6 +745,24 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
     case XAPI_USER_CREATE_FIRST: regs->rax = do_xapi_UserCreateFirst(regs->rdi, regs->rsi); break;
     case XAPI_GET_TIME_NANO: regs->rax = nanoTime(); break;
     case XAPI_POWER_ACTION:
+    {
+        /*
+         * Power transitions are machine-global and cannot be interrupted, so
+         * they require Root/System credentials. XPERM_CS is deliberately not
+         * enough: Admin holds ChangeSettings but must not power the machine
+         * down out from under other sessions.
+         */
+        UserType caller_type = permissions_current_type();
+        if (caller_type != XUT_Root && caller_type != XUT_System)
+        {
+            regs->rax = (uint64_t)-EPERM;
+            break;
+        }
+        if (regs->rdi != XPOWER_SHUTDOWN && regs->rdi != XPOWER_REBOOT)
+        {
+            regs->rax = (uint64_t)-EINVAL;
+            break;
+        }
         if (EFI_ST != NULL && EFI_BC != NULL)
         {
             if (regs->rdi == XPOWER_SHUTDOWN)
@@ -753,19 +772,21 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
         }
         regs->rax = (uint64_t)-1;
         break;
+    }
     case XAPI_NOTIFY_SEND: case XAPI_NOTIFY_SET_PROCOR: regs->rax = (uint64_t)-ENOSYS; break;
 
     /* Private XJ380 extension range; this is not a stable public ABI. */
-    case SXAH_CHECK_TERMINAL_INIT_STATUS: regs->rax = (uint64_t)check_terminal_init_status(); break;
+    case SXAH_CHECK_TERMINAL_INIT_STATUS: regs->rax = (uint64_t)x3tp_terminal_ready(); break;
     case SXAH_SYSCALL_RETURN:
         // get_current_task()->parent_group->msgprci = false;
         // message_end();
         break;
-    case SXAH_MARK_IS_TERMINAL: mark_process_is_terminal(); break;
-    case SXAH_READ_OUTPUT_BUFFER: regs->rax = read_terminal_app_output_buffer((char *)regs->rdi, (size_t)regs->rsi); break;
-    case SXAH_WRITE_INPUT_BUFFER: regs->rax = write_terminal_app_output_buffer((const char *)regs->rdi); break;
-    case SXAH_CHECK_INPUT_BUFFER: regs->rax = check_input_waiting_status(); break;
-    case SXAH_UNLOCK_OUTPUT_LOCK: terminal_finish_app_output(); break;
+    case SXAH_MARK_IS_TERMINAL: x3tp_mark_terminal(); break;
+    case SXAH_READ_OUTPUT_BUFFER: regs->rax = x3tp_terminal_read_output((char *)regs->rdi, (size_t)regs->rsi); break;
+    case SXAH_WRITE_INPUT_BUFFER: regs->rax = x3tp_terminal_write_input((const char *)regs->rdi); break;
+    case SXAH_CHECK_INPUT_BUFFER: regs->rax = x3tp_terminal_waiting_status(); break;
+    case SXAH_UNLOCK_OUTPUT_LOCK: x3tp_terminal_finish_output(); break;
+    case SXAH_CHECK_USER_PASSWORD: regs->rax = do_sxah_check_password(regs->rdi, regs->rsi); break;
     case SXAH_MESSAGE_ASK: regs->rax = message_ask(regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8); break;
     case SXAH_INSTALLER_ENUM_DISKS: regs->rax = do_xapi_InstallerEnumDisks(regs->rdi); break;
     case SXAH_INSTALLER_START: regs->rax = do_xapi_InstallerStart(regs->rdi); break;

@@ -1,34 +1,35 @@
 #include <device.h>
 #include <errno.h>
 #include <fs/vfs/vfs.h>
-#include <installer_mode.h>
+#include <initrd.h>
 #include <krlibc.h>
 #include <proto.hpp>
 #include <task/pcb.h>
 #include <user/user.h>
 
-static const BOOT_CONFIG *g_installer_boot_config = NULL;
-static vfs_node_t         g_installer_base_root = NULL;
-static bool               g_installer_root_is_tmpfs_ready = false;
+static const BOOT_CONFIG *g_initrd_boot_config = NULL;
+static vfs_node_t         g_initrd_base_root = NULL;
+static bool               g_initrd_root_is_tmpfs_ready = false;
 
 extern int tmpfs_setup();
 
-bool installer_boot_active(const BOOT_CONFIG &boot_config)
+bool initrd_boot_active(const BOOT_CONFIG &boot_config)
 {
-    /* live root：引导器把整个 live 介质载入 RAM（installer_root_pak），
-       内核以 tmpfs 为根解包。不再要求 system_payload（装系统走 xbps）。 */
-    return (boot_config.boot_flags & BOOT_FLAG_LIVE_ROOT) != 0 &&
-           boot_config.installer_root_pak != 0 &&
-           boot_config.installer_root_pak_size >= sizeof(xj380_pak_header);
+    /* Generic initrd: the bootloader loaded an image into RAM and set
+       BOOT_FLAG_INITRD. The kernel unpacks it to tmpfs; live/installer
+       detection belongs to user space. XJPAK10 is the only format for now. */
+    return (boot_config.boot_flags & BOOT_FLAG_INITRD) != 0 &&
+           boot_config.initrd_phys != 0 &&
+           boot_config.initrd_size >= sizeof(xj380_pak_header);
 }
 
-static const uint8_t *installer_phys_blob(uint64_t phys, uint64_t size)
+static const uint8_t *initrd_phys_blob(uint64_t phys, uint64_t size)
 {
     if (phys == 0 || size == 0) return NULL;
     return (const uint8_t *)(phys + 0xffff800000000000ULL);
 }
 
-static int installer_mkdir_parent(const char *path)
+static int initrd_mkdir_parent(const char *path)
 {
     if (path == NULL || path[0] != '/') return -EINVAL;
     char temp[512];
@@ -46,9 +47,9 @@ static int installer_mkdir_parent(const char *path)
     return EOK;
 }
 
-static int installer_write_file(const char *path, const uint8_t *data, size_t size)
+static int initrd_write_file(const char *path, const uint8_t *data, size_t size, uint32_t mode)
 {
-    if (installer_mkdir_parent(path) < 0) return -EINVAL;
+    if (initrd_mkdir_parent(path) < 0) return -EINVAL;
     vfs_mkfile(path);
     vfs_node_t node = vfs_open(path);
     if (node == NULL) return -ENOENT;
@@ -57,11 +58,12 @@ static int installer_write_file(const char *path, const uint8_t *data, size_t si
         vfs_close(node);
         return -EIO;
     }
+    if (mode != 0) (void)vfs_chmod(node, mode & 07777);
     vfs_close(node);
     return EOK;
 }
 
-static int installer_unpack_pak(const uint8_t *pak, size_t pak_size)
+static int initrd_unpack_pak(const uint8_t *pak, size_t pak_size)
 {
     if (pak == NULL || pak_size < sizeof(xj380_pak_header)) return -EINVAL;
     const xj380_pak_header *header = (const xj380_pak_header *)pak;
@@ -85,11 +87,19 @@ static int installer_unpack_pak(const uint8_t *pak, size_t pak_size)
         if (entry->type == XJ380_PAK_ENTRY_DIR)
         {
             vfs_mkdir(path);
+            if (entry->mode != 0)
+            {
+                vfs_node_t node = vfs_open(path);
+                if (node != NULL) {
+                    (void)vfs_chmod(node, entry->mode & 07777);
+                    vfs_close(node);
+                }
+            }
         }
         else if (entry->type == XJ380_PAK_ENTRY_FILE)
         {
             if (off > pak_size || entry->size > pak_size - off) return -EINVAL;
-            int ret = installer_write_file(path, pak + off, (size_t)entry->size);
+            int ret = initrd_write_file(path, pak + off, (size_t)entry->size, entry->mode);
             if (ret < 0) return ret;
             off += (size_t)entry->size;
         }
@@ -101,17 +111,17 @@ static int installer_unpack_pak(const uint8_t *pak, size_t pak_size)
     return EOK;
 }
 
-int installer_prepare_root(const BOOT_CONFIG &boot_config)
+int initrd_prepare_root(const BOOT_CONFIG &boot_config)
 {
-    g_installer_boot_config = &boot_config;
-    g_installer_base_root = rootdir;
+    g_initrd_boot_config = &boot_config;
+    g_initrd_base_root = rootdir;
 
     int ret = tmpfs_setup();
     if (ret < 0) return ret;
     vfs_node_t tmp_root = vfs_open("/tmp");
     if (tmp_root == NULL) return -ENOENT;
     set_rootdir(tmp_root);
-    g_installer_root_is_tmpfs_ready = true;
+    g_initrd_root_is_tmpfs_ready = true;
 
     vfs_mkdir("/dev");
     vfs_mkdir("/tmp");
@@ -124,26 +134,25 @@ int installer_prepare_root(const BOOT_CONFIG &boot_config)
     vfs_mkdir("/system/resources/image");
     vfs_node_t dev = vfs_open("/dev");
     if (dev == NULL) return -ENOENT;
-    if (vfs_mount((const char *)DEVFS_REGISTER_ID, dev) < 0) return -EIO;
+    if (vfs_mount_virtual(DEVFS_REGISTER_ID, dev) < 0) return -EIO;
 
-    const uint8_t *root_pak = installer_phys_blob(boot_config.installer_root_pak,
-                                                  boot_config.installer_root_pak_size);
-    ret = installer_unpack_pak(root_pak, (size_t)boot_config.installer_root_pak_size);
+    const uint8_t *root_pak = initrd_phys_blob(boot_config.initrd_phys, boot_config.initrd_size);
+    ret = initrd_unpack_pak(root_pak, (size_t)boot_config.initrd_size);
     if (ret < 0) return ret;
     return EOK;
 }
 
-bool installer_root_is_tmpfs_ready()
+bool initrd_root_is_tmpfs_ready()
 {
-    return g_installer_root_is_tmpfs_ready;
+    return g_initrd_root_is_tmpfs_ready;
 }
 
-const BOOT_CONFIG *installer_current_boot_config()
+const BOOT_CONFIG *initrd_current_boot_config()
 {
-    return g_installer_boot_config;
+    return g_initrd_boot_config;
 }
 
-vfs_node_t installer_base_root()
+vfs_node_t initrd_base_root()
 {
-    return g_installer_base_root;
+    return g_initrd_base_root;
 }

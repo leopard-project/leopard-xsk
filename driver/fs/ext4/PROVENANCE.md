@@ -198,7 +198,7 @@ lifetime merely because a package or registration matches.
 The original `kernel/installer/source_lifetime.cpp` and `jobs.cpp` add retained
 boot-source registration/lease checks and bounded opaque kernel request handles.
 New private RAM-tree preparation extends existing first-party `tmpfs.cpp` and
-`installer_mode.cpp` without importing another tmpfs or runtime implementation.
+`initrd.cpp` without importing another tmpfs or runtime implementation.
 The real devfs capture, read-only lease query and quiescent job-reaper hooks
 reuse existing kernel types and retain their ABI/layout. These are separate
 original Apache-2.0 source reviews, outside the 18-file ext4 directory inventory;

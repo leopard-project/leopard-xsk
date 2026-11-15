@@ -131,10 +131,46 @@ static size_t pts_data_available(pty_handle_t *pair)
     return 0;
 }
 
-static void pts_ctrl_assign(pty_handle_t *pair)
+static pcb_t pty_caller_group(void)
 {
     tcb_t task = get_current_task();
-    pair->ctrl_pgid = task != NULL && task->parent_group != NULL ? (int)task->parent_group->pid : 0;
+    return task != NULL ? task->parent_group : NULL;
+}
+
+// True when pgid names a live process group inside `sid`.
+static bool pty_pgid_in_session(int pgid, size_t sid)
+{
+    if (pgid <= 0 || sid == 0) return false;
+    pcb_t member = found_pgrp(pgid);
+    return member != NULL && member->sid == sid;
+}
+
+// Called with pair->lock held; the caller has already validated sid/pgid.
+static void pts_ctrl_assign(pty_handle_t *pair, size_t sid, size_t pgid, size_t owner_pid)
+{
+    pair->ctrl_sid       = (int)sid;
+    pair->ctrl_pgid      = (int)pgid;
+    pair->ctrl_owner_pid = (int)owner_pid;
+}
+
+// Update winsize and notify the foreground pgrp only when it actually changed.
+// The signal is sent after dropping pair->lock (signal_send_group takes the
+// process-list lock and must not run under a spinlock here).
+static errno_t pty_set_winsize(pty_handle_t *pair, const struct winsize *ws)
+{
+    if (ws == NULL) return -EFAULT;
+
+    int  notify_pgid = 0;
+    spin_lock(&pair->lock);
+    if (memcmp(&pair->win, ws, sizeof(pair->win)) != 0)
+    {
+        memcpy(&pair->win, ws, sizeof(pair->win));
+        notify_pgid = pair->ctrl_pgid;
+    }
+    spin_unlock(&pair->lock);
+
+    if (notify_pgid > 0) signal_send_group(notify_pgid, SIGWINCH);
+    return EOK;
 }
 
 static void ptmx_open(void *parent, const char *name, vfs_node_t node)
@@ -231,10 +267,29 @@ static void ptmx_close(void *handle)
     pty_handle_t *pair = (pty_handle_t *)handle;
     if (pair == NULL) return;
 
+    int  hup_pgid = 0;
+    bool destroy  = false;
+
     spin_lock(&pair->lock);
     if (pair->master_fds > 0) pair->master_fds--;
-    bool destroy = pair->master_fds == 0 && pair->slave_fds == 0;
+    if (pair->master_fds == 0)
+    {
+        // The master went away: hang up the slave foreground job exactly once,
+        // then keep the pair alive while a slave still holds it open so slave
+        // reads drain and report EOF instead of touching freed memory.
+        if (pair->slave_fds > 0 && !pair->hup_sent &&
+            (pair->ctrl_pgid > 0 || pair->ctrl_sid > 0))
+        {
+            pair->hup_sent = true;
+            // Foreground pgrp first; the session leader (pid == sid) is the
+            // fallback when no foreground group was ever set.
+            hup_pgid = pair->ctrl_pgid > 0 ? pair->ctrl_pgid : pair->ctrl_sid;
+        }
+        destroy = pair->slave_fds == 0;
+    }
     spin_unlock(&pair->lock);
+
+    if (hup_pgid > 0) signal_send_group(hup_pgid, SIGHUP);
 
     if (destroy)
     {
@@ -438,6 +493,9 @@ static errno_t ptmx_ioctl(void *handle, size_t request, void *arg)
     if (pair == NULL) return -ENOTTY;
 
     uint32_t req = (uint32_t)request;
+    // Winsize changes on either side notify the slave foreground group.
+    if (req == TIOCSWINSZ) return pty_set_winsize(pair, (const struct winsize *)arg);
+
     errno_t ret = EOK;
     spin_lock(&pair->lock);
     switch (req)
@@ -473,14 +531,6 @@ static errno_t ptmx_ioctl(void *handle, size_t request, void *arg)
             break;
         }
         memcpy(arg, &pair->win, sizeof(pair->win));
-        break;
-    case TIOCSWINSZ:
-        if (arg == NULL)
-        {
-            ret = -EFAULT;
-            break;
-        }
-        memcpy(&pair->win, arg, sizeof(pair->win));
         break;
     default:
         ret = -ENOTTY;
@@ -684,7 +734,65 @@ static errno_t pts_ioctl(void *handle, size_t request, void *arg)
     pty_handle_t *pair = (pty_handle_t *)handle;
     if (pair == NULL) return -ENOTTY;
 
-    uint32_t req = (uint32_t)request;
+    uint32_t req    = (uint32_t)request;
+    pcb_t    caller = pty_caller_group();
+
+    // Job-control ioctls scan the process table, so they are validated before
+    // taking pair->lock (never hold a pty spinlock while taking pcb locks).
+    if (req == TIOCSWINSZ) return pty_set_winsize(pair, (const struct winsize *)arg);
+
+    if (req == TIOCSCTTY)
+    {
+        if (caller == NULL) return -ESRCH;
+        int flags = (int)(uintptr_t)arg;
+        if (flags != 0 && flags != 1) return -EINVAL;
+        if (caller->sid == 0) return -EPERM;
+        // Linux: acquiring a controlling terminal needs a session leader;
+        // arg == 1 explicitly steals one from another session.
+        if (caller->pid != caller->sid && flags != 1) return -EPERM;
+
+        spin_lock(&pair->lock);
+        bool in_use = pair->ctrl_sid != 0 && pair->ctrl_sid != (int)caller->sid;
+        if (in_use && flags != 1)
+        {
+            spin_unlock(&pair->lock);
+            return -EPERM;
+        }
+        pts_ctrl_assign(pair, caller->sid, caller->pgid, caller->pid);
+        spin_unlock(&pair->lock);
+        return EOK;
+    }
+
+    if (req == TIOCSPGRP)
+    {
+        if (arg == NULL) return -EFAULT;
+        if (caller == NULL) return -ESRCH;
+        int pgid = *(const int *)arg;
+        if (pgid <= 0) return -EINVAL;
+
+        spin_lock(&pair->lock);
+        int attached_sid = pair->ctrl_sid;
+        spin_unlock(&pair->lock);
+
+        // A terminal only accepts a foreground group from the session that owns
+        // it. If it is not attached yet, the caller's session claims it.
+        size_t sid = attached_sid > 0 ? (size_t)attached_sid : caller->sid;
+        if (caller->sid != sid) return -EPERM;
+        if (!pty_pgid_in_session(pgid, sid)) return -EPERM;
+
+        spin_lock(&pair->lock);
+        pair->ctrl_pgid = pgid;
+        if (pair->ctrl_sid == 0)
+        {
+            pair->ctrl_sid       = (int)sid;
+            pair->ctrl_owner_pid = (int)caller->pid;
+        }
+        spin_unlock(&pair->lock);
+        return EOK;
+    }
+
+    int fallback_pgid = caller != NULL ? (int)caller->pgid : 0;
+
     errno_t ret = EOK;
     spin_lock(&pair->lock);
     switch (req)
@@ -696,17 +804,6 @@ static errno_t pts_ioctl(void *handle, size_t request, void *arg)
             break;
         }
         memcpy(arg, &pair->win, sizeof(pair->win));
-        break;
-    case TIOCSWINSZ:
-        if (arg == NULL)
-        {
-            ret = -EFAULT;
-            break;
-        }
-        memcpy(&pair->win, arg, sizeof(pair->win));
-        break;
-    case TIOCSCTTY:
-        pts_ctrl_assign(pair);
         break;
     case TCGETS:
         if (arg == NULL)
@@ -732,10 +829,7 @@ static errno_t pts_ioctl(void *handle, size_t request, void *arg)
             ret = -EFAULT;
             break;
         }
-        *(int *)arg = pair->ctrl_pgid != 0 ? pair->ctrl_pgid : get_current_task()->parent_group->pid;
-        break;
-    case TIOCSPGRP:
-        if (arg != NULL) pair->ctrl_pgid = *(int *)arg;
+        *(int *)arg = pair->ctrl_pgid != 0 ? pair->ctrl_pgid : fallback_pgid;
         break;
     case KDGKBMODE:
         if (arg == NULL)
@@ -875,6 +969,94 @@ static struct vfs_callback pts_callbacks = {
     .rename   = (vfs_rename_t)pty_dummy,
 };
 
+void pty_detach_controlling(size_t sid, size_t owner_pid)
+{
+    if (sid == 0 || owner_pid == 0) return;
+
+    spin_lock(&pty_global_lock);
+    pty_handle_t *pos;
+    pty_handle_t *n;
+    llist_for_each(pos, n, &ptmx_list_head, list_node)
+    {
+        spin_lock(&pos->lock);
+        if (pos->ctrl_sid == (int)sid && pos->ctrl_owner_pid == (int)owner_pid)
+        {
+            // The process that attached this controlling terminal is leaving
+            // for a new session; do not keep a stale foreground pgrp pointing
+            // into the old one. Other processes' terminals are untouched.
+            pos->ctrl_pgid       = 0;
+            pos->ctrl_sid        = 0;
+            pos->ctrl_owner_pid = 0;
+        }
+        spin_unlock(&pos->lock);
+    }
+    spin_unlock(&pty_global_lock);
+}
+
+int pty_session_foreground_pgid(size_t sid)
+{
+    if (sid == 0) return -1;
+
+    int result = -1;
+    spin_lock(&pty_global_lock);
+    pty_handle_t *pos;
+    pty_handle_t *n;
+    llist_for_each(pos, n, &ptmx_list_head, list_node)
+    {
+        if (pos->ctrl_sid != (int)sid) continue;
+        spin_lock(&pos->lock);
+        result = pos->ctrl_pgid;
+        spin_unlock(&pos->lock);
+        break;
+    }
+    spin_unlock(&pty_global_lock);
+    return result;
+}
+
+// VFS /dev/tty resolver: open the slave side of the pty that is the controlling
+// terminal of the caller's session. Returns a referenced node, or NULL when the
+// session has no usable pty (the static devfs /dev/tty then takes over).
+//
+// Simplification for this pass: at most one pty is tracked per session
+// (Linux also allows only one controlling terminal per session). A hung-up or
+// locked pty is not returned, so the caller falls back to the console tty
+// instead of receiving ENXIO.
+static vfs_node_t pty_open_ctty_node(void)
+{
+    pcb_t caller = pty_caller_group();
+    if (caller == NULL || caller->sid == 0) return NULL;
+
+    vfs_node_t result = NULL;
+    spin_lock(&pty_global_lock);
+    pty_handle_t *pos;
+    pty_handle_t *n;
+    llist_for_each(pos, n, &ptmx_list_head, list_node)
+    {
+        if (pos->ctrl_sid != (int)caller->sid || pos->slave_node == NULL) continue;
+
+        spin_lock(&pos->lock);
+        if (pos->locked || pos->master_fds == 0)
+        {
+            spin_unlock(&pos->lock);
+            continue;
+        }
+
+        pos->slave_fds++;
+        vfs_node_t node = pos->slave_node;
+        node->handle    = pos;
+        node->type      = file_pts;
+        node->fsid      = pts_fsid;
+        node->mode      = 0666;
+        node->size      = (uint64_t)-1;
+        node->refcount++;
+        result = node;
+        spin_unlock(&pos->lock);
+        break;
+    }
+    spin_unlock(&pty_global_lock);
+    return result;
+}
+
 void pty_init()
 {
     if (pty_allocator != NULL) return;
@@ -889,6 +1071,9 @@ void pty_init()
         write_serial_fmt("pty: init failed\n");
         return;
     }
+
+    // Let vfs_open("/dev/tty") follow the caller's controlling pty.
+    vfs_set_ctty_resolver(pty_open_ctty_node);
 
     vfs_node_t dev = vfs_open("/dev");
     if (dev == NULL)

@@ -752,7 +752,7 @@ sys_(symlink, char *name, char *nw);
 sys_(rename, char *oldpath, char *newpath);
 sys_(getgroups, int count, int *gid_list);
 sys_(setgroups, int count, const int *gid_list);
-sys_(getpgid);
+sys_(getpgid, int pid);
 sys_(setpgid, int pid, int pgid);
 sys_(flock, int fd, int operation);
 sys_(chroot, char *path);

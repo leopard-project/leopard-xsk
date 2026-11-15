@@ -42,7 +42,8 @@
 #include <user/info_register.h>
 #include <hda/vsound.h>
 #include <hda/hda.h>
-#include <installer_mode.h>
+#include <initrd.h>
+#include <x3tp.h>
 
 const FrameBufferConfig *fbc_addr;
 
@@ -50,7 +51,6 @@ extern volatile int  scheduler_is_ready;
 extern XSK_SMP_INFO *xsi;
 #define NULL 0
 uint64_t *saved_mtrrs;
-void     *temp_stack[MAX_CPU_NUM];
 bool      no_interrupt = false;
 
 static OpenXJ380MouseInterruptHook g_openxj380_mouse_hook = NULL;
@@ -225,19 +225,6 @@ extern "C" void OpenXJ380Socket_NotifyProcessExit(void *process)
 #endif
 }
 
-EXPORT_SYMBOL(OpenXJ380Socket_RegisterMouseHook);
-EXPORT_SYMBOL(OpenXJ380Socket_RegisterKeyboardHook);
-EXPORT_SYMBOL(OpenXJ380Socket_MouseInterrupte);
-EXPORT_SYMBOL(OpenXJ380Socket_KeyboardInterrupt);
-EXPORT_SYMBOL(OpenXJ380Socket_UnregisterMouseHook);
-EXPORT_SYMBOL(OpenXJ380Socket_UnregisterKeyboardHook);
-EXPORT_SYMBOL(OpenXJ380Socket_FramebufferConfig);
-EXPORT_SYMBOL(OpenXJ380Socket_PowerAction);
-EXPORT_SYMBOL(OpenXJ380Socket_RegisterSyscallHook);
-EXPORT_SYMBOL(OpenXJ380Socket_UnregisterSyscallHook);
-EXPORT_SYMBOL(OpenXJ380Socket_RegisterProcessExitHook);
-EXPORT_SYMBOL(OpenXJ380Socket_UnregisterProcessExitHook);
-EXPORT_SYMBOL(OpenXJ380Socket_NotifyProcessExit);
 
 extern bool allow_to_flush;
 extern void ahci_set_accel(bool enabled);
@@ -373,6 +360,8 @@ extern void     xhci_start_workers();
 #endif
 extern void     mount_root();
 extern void     stdio_init();
+extern void     fb_init();
+extern void     vkbd_init();
 extern int      socketfs_setup();
 extern int      procfs_setup();
 extern int      dnsfs_setup();
@@ -380,15 +369,94 @@ extern int      nmfs_setup();
 extern int      tmpfs_setup();
 EFI_SYSTEM_TABLE *EFI_ST;
 BOOT_CONFIG *EFI_BC;
-static BOOT_CONFIG g_kernel_boot_config;
+static BOOT_CONFIG  g_kernel_boot_config;
+static const char  *g_boot_cmdline;
+static uint32_t     g_boot_cmdline_size;
+
+static const char *boot_cmdline_value(const char *cmdline, uint32_t cmdline_size,
+                                      const char *key, char *out, size_t capacity)
+{
+    if (cmdline == NULL || capacity == 0 || cmdline_size == 0) return NULL;
+
+    const char *p    = cmdline;
+    const char *end  = p + cmdline_size;
+    const size_t key_len = strlen(key);
+
+    while (p < end && *p != '\0')
+    {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+        if (p >= end || *p == '\0') break;
+        if (*p == '#')
+        {
+            while (p < end && *p != '\n') ++p;
+            continue;
+        }
+
+        const char *line_end = p;
+        while (line_end < end && *line_end != '\n') ++line_end;
+
+        const char *eq = p;
+        while (eq < line_end && *eq != '=') ++eq;
+        if (eq < line_end)
+        {
+            const char *key_end = eq;
+            while (key_end > p && (key_end[-1] == ' ' || key_end[-1] == '\t')) --key_end;
+            if ((size_t)(key_end - p) == key_len && memcmp(p, key, key_len) == 0)
+            {
+                const char *value = eq + 1;
+                while (value < line_end && (*value == ' ' || *value == '\t')) ++value;
+                const char *value_end = line_end;
+                while (value_end > value &&
+                       (value_end[-1] == ' ' || value_end[-1] == '\t' || value_end[-1] == '\r')) --value_end;
+                const char *hash = value;
+                while (hash < value_end && *hash != '#') ++hash;
+                value_end = hash;
+                while (value_end > value &&
+                       (value_end[-1] == ' ' || value_end[-1] == '\t' || value_end[-1] == '\r')) --value_end;
+                if (value_end > value + 1 && value[0] == '"' && value_end[-1] == '"')
+                {
+                    ++value;
+                    --value_end;
+                }
+
+                size_t length = (size_t)(value_end - value);
+                if (length >= capacity) length = capacity - 1;
+                memcpy(out, value, length);
+                out[length] = '\0';
+                return out;
+            }
+        }
+
+        p = line_end;
+        if (p < end) ++p;
+    }
+    return NULL;
+}
 
 extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &SystemTable, BOOT_CONFIG &BootConfigIn)
 {
-    memcpy(&g_kernel_boot_config, &BootConfigIn, sizeof(g_kernel_boot_config));
+    uint32_t cmdline_size = BootConfigIn.cmdline_size;
+    bool     cmdline_invalid = cmdline_size > BOOT_CONFIG_CMDLINE_MAX;
+    if (cmdline_invalid) cmdline_size = 0;
+
+    /* Copy only the fixed header. The cmdline tail stays in the bootloader's
+       HHDM pool allocation, which is reserved in the UEFI memory map and is
+       never reclaimed by the kernel; avoid a 4 KiB per-kernel static copy. */
+    memcpy(&g_kernel_boot_config, &BootConfigIn, sizeof(BOOT_CONFIG));
+    g_kernel_boot_config.cmdline_size = cmdline_size;
+    g_boot_cmdline_size = cmdline_size;
+    g_boot_cmdline = cmdline_size != 0 ? BootConfigIn.cmdline : NULL;
     BOOT_CONFIG &BootConfig = g_kernel_boot_config;
 
     fbc_addr = &fbc;
     console_init(fbc);
+    if (BootConfig.layout != BOOT_CONFIG_LAYOUT)
+    {
+        write_serial_fmt("BOOT: config layout 0x%x, expected 0x%x; rebuild bootloader and kernel together\n",
+                         BootConfig.layout, BOOT_CONFIG_LAYOUT);
+        for (;;) __asm__ volatile("cli; hlt" ::: "memory");
+    }
+    if (cmdline_invalid) write_serial_string("BOOT: cmdline too large, ignored\n");
     no_interrupt = true;
     disable_intr();
     EFI_ST = &SystemTable;
@@ -423,11 +491,13 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     write_serial_string("BOOT: pci_init begin\n");
     pci_init();
     write_serial_string("BOOT: pci_init done\n");
-    write_serial_fmt("VM hint: %s\n", BootConfig.is_qemu == 1 ? "QEMU/BOCHS" : "generic/VMware/real hardware");
-    if (BootConfig.boot_flags != 0) write_serial_fmt("Boot option flags: 0x%llx\n", BootConfig.boot_flags);
+    write_serial_fmt("VM hint: %s\n",
+                     boot_config_is_qemu(&BootConfig) ? "QEMU/BOCHS" : "generic/VMware/real hardware");
+    if (BootConfig.boot_flags != 0)
+        write_serial_fmt("Boot option flags: 0x%llx\n", (unsigned long long)BootConfig.boot_flags);
     if ((BootConfig.boot_flags & BOOT_FLAG_LAST_KNOWN_GOOD) != 0)
         write_serial_string("BOOT: last known good configuration selected\n");
-    ahci_set_environment(BootConfig.is_qemu == 1);
+    ahci_set_environment(boot_config_is_qemu(&BootConfig));
     write_serial_string("BOOT: ahci_setup begin\n");
     ahci_setup();
     write_serial_string("BOOT: ahci_setup done\n");
@@ -458,17 +528,17 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
 #endif
     // sb16_init();
 
+    // Input Core v2: static seat/endpoint/source tables must exist before the
+    // first keyboard IRQ or USB worker can enqueue an event.
+    x3tp_init();
+
     keyboard_init();
     mouse_init();
-
     disable_intr();
 
     process_setup();
 
-    // 超绝偷懒解法，等有内存管理且在这之前初始化的时候叫我来改
     saved_mtrrs = (uint64_t *)((uint64_t)BootConfig.saved_mtrrs + 0xffff800000000000);
-    for (int i = 0; i < MAX_CPU_NUM; ++i)
-        temp_stack[i] = BootConfig.temp_stack[i];
 
     init_smp(BootConfig.MADT);
 
@@ -502,15 +572,21 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
 #endif
 
     ext4fs_init();
-    bool installer_mode = installer_boot_active(BootConfig);
-    if (installer_mode)
-        installer_prepare_root(BootConfig);
+    bool initrd_mode = initrd_boot_active(BootConfig);
+    if (initrd_mode)
+        initrd_prepare_root(BootConfig);
     else
         mount_root();
-    if (!installer_root_is_tmpfs_ready()) tmpfs_setup();
+    if (!initrd_root_is_tmpfs_ready()) tmpfs_setup();
     // Permission policy is boot-time config: the kernel owns the mechanism,
     // permissions.conf owns grade masks and public/protected path sets.
-    permissions_init("/system/config/permissions.conf");
+    // Fail closed: never continue into PID1 with an unloaded policy.
+    if (!permissions_init("/system/config/permissions.conf"))
+    {
+        write_serial_string("BOOT: FATAL: permissions policy unavailable; refusing to start\n");
+        disable_intr();
+        for (;;) __asm__ volatile("hlt");
+    }
     pipefs_setup();
     pty_init();
     fsgsbase_init();
@@ -519,6 +595,9 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     dnsfs_setup();
     nmfs_setup();
     stdio_init();
+    fb_init();
+    vkbd_init();
+    x3tp_console_device_init();
 
     signal_init();
     init_syscall();
@@ -544,7 +623,7 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
     init_reaper();
     write_serial_string("Process Reaper is ready\n");
 
-    if (BootConfig.is_qemu == 1) pr_warn("XJ380 is running under the QEMU/BOCHS.\n");
+    if (boot_config_is_qemu(&BootConfig)) pr_warn("XJ380 is running under the QEMU/BOCHS.\n");
 
     // create_kernel_thread((void *)tst, NULL, (char *)"1", NULL);
     if ((BootConfig.boot_flags & (BOOT_FLAG_SAFE_MODE | BOOT_FLAG_SAFE_STORAGE_IO)) != 0) {
@@ -555,10 +634,14 @@ extern "C" void KernelMain(const FrameBufferConfig &fbc, EFI_SYSTEM_TABLE &Syste
         write_serial_string("AHCI: keeping conservative IO path on vmware/real hardware\n");
     }
     user_session_use_root();
-    /* PID1 由引导器经 BOOT_CONFIG.init 指定（boot.conf），内核不再硬编码；空则回退默认 */
-    const char *init_path = BootConfig.init[0] ? BootConfig.init : "/system/leopard/leopard-rc.elf";
-    write_serial_fmt("BOOT: launching init %s\n", init_path);
-    create_user_process_from_file((char *)init_path, NULL, NULL);
+    /* PID1 由 cmdline 的 init= 指定（boot.conf），内核不再硬编码；空则回退默认 */
+    char        init_path[512];
+    const char *configured_init = boot_cmdline_value(g_boot_cmdline, g_boot_cmdline_size,
+                                                     "init", init_path, sizeof(init_path));
+    if (configured_init != NULL && configured_init[0] == '\0') configured_init = NULL;
+    const char *init = configured_init != NULL ? configured_init : "/system/leopard/leopard-rc.elf";
+    write_serial_fmt("BOOT: launching init %s\n", init);
+    create_user_process_from_file((char *)init, NULL, NULL);
 
 
     // delay_s_hp(60);

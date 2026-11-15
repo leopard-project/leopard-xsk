@@ -29,7 +29,13 @@ uint32_t user_gid(const UserInfo *user);
 UserInfo *task_effective_user();
 bool user_session_needs_oobe();
 int user_session_list(UserInfo *out, int max_count);
+/* 按名字查注册表。供 home 目录归属/持久化使用；找不到返回 false。 */
+bool user_lookup_name(const char *name, UserInfo *out);
+/* uid → XUT 等级是固定映射；身份结构由 uid 推导，不依赖登录会话。 */
+UserType user_type_from_uid(uint32_t uid);
+bool user_identity_from_uid(uint32_t uid, UserInfo *out);
 int user_session_login(const char *username, const char *password);
+int user_session_check_password(const char *username, const char *password);
 int user_session_create_first(const char *username, const char *password);
 void user_session_use_root();
 void user_session_use_login();

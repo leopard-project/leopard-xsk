@@ -198,7 +198,7 @@ void vmware_poweroff_fallback()
 void poweroff_fallback(BOOT_CONFIG *boot_config)
 {
     acpi_poweroff(boot_config);
-    if (boot_config != NULL && boot_config->is_qemu == 1) {
+    if (boot_config != NULL && boot_config_is_qemu(boot_config)) {
         qemu_poweroff_fallback();
     } else {
         vmware_poweroff_fallback();

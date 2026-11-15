@@ -123,9 +123,9 @@ static void write_serial_output_unlocked(const char *str)
     {
         return;
     }
-#if !OPENXJ380_INPUT_OUTPUT_DISABLED
-    console_write(str);
-#endif
+    /* Serial logging is serial-only.  The framebuffer belongs to the
+     * user-space terminal host (conhost/compositor); kernel and service logs
+     * must never leak into that VT. */
     write_serial_string_unlocked(str);
     notify_serial_output_observer(str);
 }

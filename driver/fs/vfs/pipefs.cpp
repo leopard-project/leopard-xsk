@@ -235,7 +235,7 @@ int pipefs_poll(void *file, size_t events) {
 }
 
 int pipefs_mount(const char *handle, vfs_node_t node) {
-    if ((uint64_t)handle != PIEFS_REGISTER_ID) return VFS_STATUS_FAILED;
+    (void)handle; // vfs_mount_virtual() 已按注册 ID 选中本文件系统
     // The mount root keeps directory semantics even if it covered a file node.
     node->type  = file_dir;
     node->size  = 0;
@@ -294,7 +294,7 @@ void pipefs_setup() {
         write_serial_string("pipefs: open /pipe failed\n");
         return;
     }
-    if (vfs_mount((const char *)PIEFS_REGISTER_ID, node) == VFS_STATUS_FAILED) {
+    if (vfs_mount_virtual(PIEFS_REGISTER_ID, node) == VFS_STATUS_FAILED) {
         write_serial_string("pipefs: mount failed\n");
         return;
     }

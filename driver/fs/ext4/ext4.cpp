@@ -70,7 +70,7 @@ void apply_inode(Mount *mount, vfs_node_t node, const xjext4::Inode &inode)
     node->blksz = mount->writer->view().block_size();
     node->owner = inode.uid;
     node->group = inode.gid;
-    node->permissions = inode.mode & 07777;
+    vfs_node_set_mode(node, inode.mode & 07777);
     node->fsid = (uint16_t)mount->fsid;
     if (node->root != NULL) node->dev = node->root->dev;
 }
@@ -78,19 +78,19 @@ void apply_inode(Mount *mount, vfs_node_t node, const xjext4::Inode &inode)
 bool read_device(void *context, uint64_t offset, void *buffer, xjext4::Size size)
 {
     Mount *mount = (Mount *)context;
-    return vfs_read(mount->device, buffer, offset, size) == size;
+    return vfs_read_raw(mount->device, buffer, offset, size) == size;
 }
 
 bool write_device(void *context, uint64_t offset, const void *buffer, xjext4::Size size)
 {
     Mount *mount = (Mount *)context;
-    return vfs_write(mount->device, (void *)buffer, offset, size) == size;
+    return vfs_write_raw(mount->device, buffer, offset, size) == size;
 }
 
 bool flush_device(void *context)
 {
     Mount *mount = (Mount *)context;
-    return vfs_ioctl(mount->device, IOBLKSYNC, NULL) == 0;
+    return vfs_ioctl_raw(mount->device, IOBLKSYNC, NULL) == 0;
 }
 
 int validate_root(void *context, const xjext4::Volume &volume)
@@ -252,8 +252,10 @@ int ext4_mkdir(void *parent, const char *name, vfs_node_t node)
     if (directory == NULL || name == NULL || node == NULL) return VFS_STATUS_FAILED;
     lock();
     xjext4::Inode created;
+    uint32_t mode = 0040000U | (vfs_node_mode(node) & 07777);
     int error = directory->mount->writer->create(directory->inode.number, name,
-                                                0040755, 0, 0, seconds_now(), created);
+                                                (uint16_t)mode, node->owner, node->group,
+                                                seconds_now(), created);
     if (!error)
     {
         Node *handle = make_node(directory->mount, created, directory->inode.number);
@@ -275,8 +277,10 @@ int ext4_mkfile(void *parent, const char *name, vfs_node_t node)
     if (directory == NULL || name == NULL || node == NULL) return VFS_STATUS_FAILED;
     lock();
     xjext4::Inode created;
+    uint32_t mode = 0100000U | (vfs_node_mode(node) & 07777);
     int error = directory->mount->writer->create(directory->inode.number, name,
-                                                0100644, 0, 0, seconds_now(), created);
+                                                (uint16_t)mode, node->owner, node->group,
+                                                seconds_now(), created);
     if (!error)
     {
         Node *handle = make_node(directory->mount, created, directory->inode.number);
@@ -388,9 +392,8 @@ int ext4_do_mount(const char *source, vfs_node_t node, const XJ_ROOT_BINDING *bi
 
 int ext4_mount(const char *source, vfs_node_t node)
 {
-    // vfs_mount() probes every registered filesystem; pseudo-filesystems pass
-    // their numeric register id as "source". Only absolute device paths apply.
-    if (source == NULL || is_virtual_fs(source) || source[0] != '/') return VFS_STATUS_FAILED;
+    // Only absolute device paths apply to a device-class filesystem.
+    if (source == NULL || source[0] != '/') return VFS_STATUS_FAILED;
     return ext4_do_mount(source, node, NULL, true);
 }
 
@@ -550,6 +553,8 @@ struct vfs_callback ext4_callbacks = {
     .resize = ext4_resize,
     .del = (vfs_del_t)ext4_delete,
     .rename = (vfs_rename_t)ext4_rename,
+    .chmod = ext4fs_chmod,
+    .chown = ext4fs_chown,
 };
 } // namespace
 
@@ -558,7 +563,7 @@ void ext4fs_init()
     if (initialized) return;
     mutex_create(&operation_lock, true);
     initialized = true;
-    filesystem_id = vfs_regist("ext4", &ext4_callbacks, 0, 0xef53);
+    filesystem_id = vfs_regist("ext4", &ext4_callbacks, VFS_DEVICE_REGISTER_ID, 0xef53);
 }
 
 int ext4fs_mount_bound_root(const char *device, const XJ_ROOT_BINDING *binding)
@@ -593,7 +598,7 @@ int ext4fs_stat(vfs_node_t node, struct stat *result)
     if (node == NULL || result == NULL) return -EINVAL;
     memset(result, 0, sizeof(*result));
     result->st_ino = node->inode;
-    result->st_mode = node->permissions | (node->type & file_dir ? 0040000 : 0100000);
+    result->st_mode = vfs_node_mode(node) | (node->type & file_dir ? 0040000 : 0100000);
     result->st_size = node->size;
     result->st_blksize = node->blksz ? node->blksz : 4096;
     return 0;

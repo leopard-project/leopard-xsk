@@ -97,9 +97,7 @@ static inline int socketfs_errno(ssize_t ret)
 
 static errno_t socketfs_mount(const char *handle, vfs_node_t node)
 {
-    if ((uint64_t)handle != NETFS_REGISTER_ID) {
-        return VFS_STATUS_FAILED;
-    }
+    (void)handle; // vfs_mount_virtual() 已按注册 ID 选中本文件系统
     node->fsid   = socketfs_id;
     node->type   = file_dir;
     node->handle = NULL;
@@ -300,7 +298,7 @@ int socketfs_setup(void)
     if (node == NULL) {
         return -ENOENT;
     }
-    if (vfs_mount((char *)NETFS_REGISTER_ID, node) == VFS_STATUS_FAILED) {
+    if (vfs_mount_virtual(NETFS_REGISTER_ID, node) == VFS_STATUS_FAILED) {
         return -EIO;
     }
     return 0;

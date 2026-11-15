@@ -7,7 +7,10 @@ Built-in driver subtree. Objects under `driver/` are linked into `kernel.krl`, u
 ```
 driver/
 ├── ahci/, ide/, nvme/    # Storage controllers
-├── fs/                   # FATFS, VFS, pseudo-filesystems
+├── fs/                   # FATFS, VFS, generic pseudo-filesystems
+├── input/                # virtual keyboard (/dev/vkbd)
+├── net/                  # nmfs/dnsfs network pseudo-filesystems
+├── tty/                  # console/tty devices (/dev/stdio,tty,null,urandom)
 ├── hda/, sb16.cpp        # Audio paths
 ├── pci/                  # PCI enumeration/config
 ├── ps2/                  # Keyboard and mouse

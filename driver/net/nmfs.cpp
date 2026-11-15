@@ -454,39 +454,85 @@ static size_t nmfs_build_ipv6_text(char *buffer, size_t size)
                             global_text);
 }
 
-static errno_t nmfs_mount(const char *handle, vfs_node_t node)
+#define NMFS_TEXT_MAX 768
+
+/* Single snapshot builder used by read() and by the size probe, so the size the
+ * VFS reports always matches the bytes read() will produce. */
+static size_t nmfs_build_text(int kind, char *buffer, size_t size)
 {
-    if ((uint64_t)handle != NM_REGISTER_ID) {
-        return VFS_STATUS_FAILED;
+    switch (kind) {
+    case NMFS_KIND_STATUS:
+        return nmfs_build_status_text(buffer, size);
+    case NMFS_KIND_STATE:
+        return nmfs_build_state_text(buffer, size);
+    case NMFS_KIND_IPV4:
+        return nmfs_build_ipv4_text(buffer, size);
+    case NMFS_KIND_IPV6:
+        return nmfs_build_ipv6_text(buffer, size);
+    default:
+        return 0;
+    }
+}
+
+static size_t nmfs_text_length(int kind)
+{
+    char text[NMFS_TEXT_MAX];
+    size_t length = nmfs_build_text(kind, text, sizeof(text));
+    if (length >= sizeof(text)) {
+        length = sizeof(text) - 1;
+    }
+    return length;
+}
+
+/* Give the node a regular-file shape: type maps to S_IFREG, size is the
+ * current snapshot length and DAC is root-owned. Re-run on every access because
+ * file_none nodes go through the stat callback, which keeps the reported size
+ * in sync with the live configuration. */
+static void nmfs_apply_attrs(vfs_node_t node, int kind)
+{
+    node->fsid  = nmfs_id;
+    node->owner = 0;
+    node->group = 0;
+
+    if (kind == NMFS_KIND_ROOT) {
+        node->type = file_dir;
+        node->size = 0;
+        vfs_node_set_mode(node, 0755);
+        return;
     }
 
-    node->fsid   = nmfs_id;
-    node->type   = file_dir;
+    node->type = file_none;
+    node->size = nmfs_text_length(kind);
+    vfs_node_set_mode(node, kind == NMFS_KIND_IPV4 ? 0644 : 0444);
+}
+
+static errno_t nmfs_mount(const char *src, vfs_node_t node)
+{
+    /* vfs_mount_virtual() already selected this filesystem by register ID. */
+    (void)src;
+
     node->handle = &nmfs_root_handle;
     nmfs_root    = node;
+    nmfs_apply_attrs(node, NMFS_KIND_ROOT);
 
     vfs_node_t status_node = vfs_child_append(node, "status", &nmfs_status_handle);
     if (status_node != NULL) {
-        status_node->type = file_stream;
-        status_node->size = (uint64_t)-1;
+        nmfs_apply_attrs(status_node, NMFS_KIND_STATUS);
     }
 
     vfs_node_t state_node = vfs_child_append(node, "state", &nmfs_state_handle);
     if (state_node != NULL) {
-        state_node->type = file_stream;
-        state_node->size = (uint64_t)-1;
+        nmfs_apply_attrs(state_node, NMFS_KIND_STATE);
     }
 
     vfs_node_t ipv4_node = vfs_child_append(node, "ipv4", &nmfs_ipv4_handle);
     if (ipv4_node != NULL) {
-        ipv4_node->type = file_stream;
-        ipv4_node->size = (uint64_t)-1;
+        nmfs_apply_attrs(ipv4_node, NMFS_KIND_IPV4);
     }
 
     vfs_node_t ipv6_node = vfs_child_append(node, "ipv6", &nmfs_ipv6_handle);
     if (ipv6_node != NULL) {
-        ipv6_node->type = file_stream;
-        ipv6_node->size = (uint64_t)-1;
+        nmfs_apply_attrs(ipv6_node, NMFS_KIND_IPV6);
     }
 
     return VFS_STATUS_SUCCESS;
@@ -497,27 +543,23 @@ static void nmfs_open(void *parent, const char *name, vfs_node_t node)
     (void)parent;
     if (node == nmfs_root) {
         node->handle = &nmfs_root_handle;
-        node->type   = file_dir;
-        node->size   = 0;
+        nmfs_apply_attrs(node, NMFS_KIND_ROOT);
     } else if (name != NULL && strcmp(name, "status") == 0) {
         node->handle = &nmfs_status_handle;
-        node->type   = file_stream;
-        node->size   = (uint64_t)-1;
+        nmfs_apply_attrs(node, NMFS_KIND_STATUS);
     } else if (name != NULL && strcmp(name, "state") == 0) {
         node->handle = &nmfs_state_handle;
-        node->type   = file_stream;
-        node->size   = (uint64_t)-1;
+        nmfs_apply_attrs(node, NMFS_KIND_STATE);
     } else if (name != NULL && strcmp(name, "ipv4") == 0) {
         node->handle = &nmfs_ipv4_handle;
-        node->type   = file_stream;
-        node->size   = (uint64_t)-1;
+        nmfs_apply_attrs(node, NMFS_KIND_IPV4);
     } else if (name != NULL && strcmp(name, "ipv6") == 0) {
         node->handle = &nmfs_ipv6_handle;
-        node->type   = file_stream;
-        node->size   = (uint64_t)-1;
+        nmfs_apply_attrs(node, NMFS_KIND_IPV6);
     } else {
-        node->type = file_stream;
-        node->size = (uint64_t)-1;
+        node->type = file_none;
+        node->size = 0;
+        vfs_node_set_mode(node, 0444);
     }
 }
 
@@ -528,14 +570,7 @@ static errno_t nmfs_stat(void *file, vfs_node_t node)
         return VFS_STATUS_FAILED;
     }
 
-    node->fsid = nmfs_id;
-    if (handle->kind == NMFS_KIND_ROOT) {
-        node->type = file_dir;
-        node->size = 0;
-    } else {
-        node->type = file_stream;
-        node->size = (uint64_t)-1;
-    }
+    nmfs_apply_attrs(node, handle->kind);
     return EOK;
 }
 
@@ -546,20 +581,10 @@ static size_t nmfs_read(void *file, void *addr, size_t offset, size_t size)
         return VFS_STATUS_FAILED;
     }
 
-    char text[768];
-    size_t text_len = 0;
+    char text[NMFS_TEXT_MAX];
     memset(text, 0, sizeof(text));
 
-    if (handle->kind == NMFS_KIND_STATUS) {
-        text_len = nmfs_build_status_text(text, sizeof(text));
-    } else if (handle->kind == NMFS_KIND_STATE) {
-        text_len = nmfs_build_state_text(text, sizeof(text));
-    } else if (handle->kind == NMFS_KIND_IPV4) {
-        text_len = nmfs_build_ipv4_text(text, sizeof(text));
-    } else if (handle->kind == NMFS_KIND_IPV6) {
-        text_len = nmfs_build_ipv6_text(text, sizeof(text));
-    }
-
+    size_t text_len = nmfs_build_text(handle->kind, text, sizeof(text));
     if (text_len >= sizeof(text)) {
         text_len = sizeof(text) - 1;
     }
@@ -624,6 +649,9 @@ static struct vfs_callback nmfs_callbacks = {
 
 int nmfs_setup(void)
 {
+    /* The NetworkManager ABI is files: status/state/ipv4/ipv6 under
+     * /run/NetworkManager. Read = query, write = apply. Do not add private
+     * ioctls or an out-of-band kernel control channel for this service. */
     nmfs_id = vfs_regist("nmfs", &nmfs_callbacks, NM_REGISTER_ID, 0x4e4d4653);
 
     vfs_mkdir("/run");
@@ -632,7 +660,7 @@ int nmfs_setup(void)
     if (nm_root == NULL) {
         return -ENOENT;
     }
-    if (vfs_mount((const char *)NM_REGISTER_ID, nm_root) == VFS_STATUS_FAILED) {
+    if (vfs_mount_virtual(NM_REGISTER_ID, nm_root) == VFS_STATUS_FAILED) {
         return -EIO;
     }
     return 0;

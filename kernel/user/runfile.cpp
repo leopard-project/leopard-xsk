@@ -19,6 +19,7 @@
 #include <syscall/syscall.h>
 #include <task/pcb.h>
 #include <user/user.h>
+#include <user/permissions.h>
 #include <user/runfile.h>
 #include <user/settings.h>
 
@@ -157,9 +158,43 @@ bool init_user_settings(const char *username)
     return write_file_if_empty(settings_path, settings_data_buffer, sizeof(settings_data_buffer));
 }
 
+static void claim_home_node(const char *path, const UserInfo *user, uint16_t mode)
+{
+    if (path == NULL || user == NULL) return;
+    vfs_node_t node = vfs_open(path);
+    if (node == NULL) return;
+    vfs_chown(node, user_uid(user), user_gid(user));
+    vfs_chmod(node, mode);
+    vfs_close(node);
+}
+
+/* 登录/OOBE 以 Root 创建 home 后，把归属交给账户本身；否则 DAC 会
+   让用户读不到也写不了自己的目录。 */
+static void claim_user_home(const char *username)
+{
+    if (username == NULL) return;
+
+    UserInfo user;
+    if (!user_lookup_name(username, &user)) return;
+
+    char home[256];
+    if (!make_user_path(home, sizeof(home), username, "")) return;
+    claim_home_node(home, &user, 0700);
+
+    char child[256];
+    if (make_user_path(child, sizeof(child), username, "/desktop"))
+        claim_home_node(child, &user, 0700);
+    if (make_user_path(child, sizeof(child), username, "/runfile.dat"))
+        claim_home_node(child, &user, 0600);
+    if (make_user_path(child, sizeof(child), username, "/settings.dat"))
+        claim_home_node(child, &user, 0600);
+}
+
 bool init_user_profile(const char *username)
 {
-    return init_user_dirs(username) && init_user_runfile(username) && init_user_settings(username);
+    bool ok = init_user_dirs(username) && init_user_runfile(username) && init_user_settings(username);
+    if (ok) claim_user_home(username);
+    return ok;
 }
 
 void init_runfile()
@@ -186,7 +221,9 @@ void runfile(char *path)
     if (strcmp("elf", exname) == 0 || strcmp("epf", exname) == 0)
     {
         // 是可执行文件
-        create_user_process_from_file(path, launch_parent, NULL);
+        // Application-initiated launches inherit the caller's credentials; a
+        // default login identity would hand a Visitor an Admin-owned child.
+        create_user_process_from_file_as(path, launch_parent, NULL, (int)XPCS_INHERIT);
         return;
     }
 
@@ -231,7 +268,7 @@ void runfile(char *path)
         {
             // 是可执行文件
             char *argv[2]    = {path, NULL};
-            create_user_process_from_file(item->runpath, launch_parent, argv);
+            create_user_process_from_file_as(item->runpath, launch_parent, argv, (int)XPCS_INHERIT);
             free(file_format);
             return;
         }

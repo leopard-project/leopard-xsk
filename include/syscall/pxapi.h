@@ -338,6 +338,7 @@ uint64_t do_xapi_GetSystemStats(uint64_t buffer);
 uint64_t do_xapi_UserOobeRequired();
 uint64_t do_xapi_UserList(uint64_t buffer, uint64_t max_count);
 uint64_t do_xapi_UserLogin(uint64_t username, uint64_t password);
+uint64_t do_sxah_check_password(uint64_t username, uint64_t password);
 uint64_t do_xapi_UserCreateFirst(uint64_t username, uint64_t password);
 uint64_t do_xapi_PowerAction(uint64_t action);
 uint64_t do_xapi_SendAppMessage(char *title, char *text);
@@ -370,15 +371,9 @@ uint64_t do_xapi_InstallerLog(uint64_t out);
 void init_syscall();
 
 // Proto (XAPI Edition)
-// 输入流路由：MSG_CHAR -> 焦点 sink（focus-agnostic，与 GUI 窗口消息投递解耦）。
-// 输入流拦截器（内核态 IME manager 注册）：返回 true = 已消费（吞掉/改道），
-// false = 放行。签名对齐上游 ime_filter_message(type, value, callback, task)，
-// 使 IME 业务能以 kmod 形式注册进来做焦点匹配。callback = (uint64_t)WinMpf。
-typedef bool (*input_interceptor_fn)(uint64_t msg_type, uint64_t lData, uint64_t callback, tcb_t task);
-void                input_route_set_interceptor(input_interceptor_fn fn);
-input_interceptor_fn input_route_interceptor(void);
-
-void input_route_dispatch(uint64_t msg_type, uint64_t hData, uint64_t lData, MsgPrcor WinMpf, tcb_t task);
+// 输入路由已迁移到 include/x3tp.h 的 Input Core v2
+// （source -> seat -> endpoint，IRQ 直接入队，无 router 线程/全局焦点）。
+// 本头文件只保留消息常量与 GUI/XAPI 声明。
 // GUI 窗口消息投递：WinMpf 回调经 message pipe 送给指定 ftask（闭源 worker 依赖此签名）。
 void do_message(uint64_t msg_type, uint64_t hData, uint64_t lData, MsgPrcor WinMpf, tcb_t ftask);
 void init_message();

@@ -59,15 +59,13 @@ uint32_t user_uid(const UserInfo *user)
     if (user == NULL) return 0;
     switch (user->user_type)
     {
-    case XUT_Root:
-    case XUT_System:
-    case XUT_Admin:
-        return 0;
-    case XUT_Visitor:
-        return 65534;
+    case XUT_Root: return 0;
+    case XUT_System: return 1;
+    case XUT_Admin: return 2;
+    case XUT_Visitor: return 65534;
     case XUT_Custom:
     default:
-        return stable_user_name_id(user->name);
+        return 10000U + (stable_user_name_id(user->name) % 50000U);
     }
 }
 
@@ -76,12 +74,10 @@ uint32_t user_gid(const UserInfo *user)
     if (user == NULL) return 0;
     switch (user->user_type)
     {
-    case XUT_Root:
-    case XUT_System:
-    case XUT_Admin:
-        return 0;
-    case XUT_Visitor:
-        return 65534;
+    case XUT_Root: return 0;
+    case XUT_System: return 1;
+    case XUT_Admin: return 2;
+    case XUT_Visitor: return 65534;
     case XUT_Custom:
     default:
         return user_uid(user);
@@ -213,6 +209,87 @@ static bool load_user_registry(UserRegisterList *registry, size_t *bytes_read)
     return read_size >= sizeof(int);
 }
 
+bool user_lookup_name(const char *name, UserInfo *out)
+{
+    if (name == NULL || out == NULL) return false;
+
+    UserRegisterList registry;
+    size_t bytes_read = 0;
+    if (!load_user_registry(&registry, &bytes_read) || bytes_read < sizeof(UserRegisterList))
+        return false;
+    if (registry.user_count < 1 || registry.user_count > 128) return false;
+
+    for (int i = 0; i < registry.user_count && i < 128; i++)
+    {
+        if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
+        if (strcmp(name, registry.uinf[i].name) != 0) continue;
+        *out = registry.uinf[i];
+        memset(out->password, 0, sizeof(out->password));
+        return true;
+    }
+    return false;
+}
+
+/* uid → XUT：0 Root、1 System、2 Admin、65534 Visitor、其余 Custom。
+   与 user_uid() 的映射严格互逆。 */
+UserType user_type_from_uid(uint32_t uid)
+{
+    switch (uid)
+    {
+    case 0:     return XUT_Root;
+    case 1:     return XUT_System;
+    case 2:     return XUT_Admin;
+    case 65534: return XUT_Visitor;
+    default:    return XUT_Custom;
+    }
+}
+
+bool user_identity_from_uid(uint32_t uid, UserInfo *out)
+{
+    if (out == NULL) return false;
+
+    memset(out, 0, sizeof(*out));
+    out->user_type = user_type_from_uid(uid);
+    switch (out->user_type)
+    {
+    case XUT_Root:
+        *out = root_user;
+        memset(out->password, 0, sizeof(out->password));
+        return true;
+    case XUT_System:
+        strcpy(out->name, "System");
+        return true;
+    case XUT_Admin:
+        strcpy(out->name, "Admin");
+        return true;
+    case XUT_Visitor:
+        strcpy(out->name, "Visitor");
+        return true;
+    case XUT_Custom:
+    default:
+        break;
+    }
+
+    /* Custom uid 是用户名哈希（11000..59999），必须从注册表取回名字，
+       否则 user_uid() 无法再推导出同一个 uid。 */
+    if (uid < 10000 || uid >= 60000) return false;
+
+    UserRegisterList registry;
+    size_t bytes_read = 0;
+    if (!load_user_registry(&registry, &bytes_read) || bytes_read < sizeof(UserRegisterList))
+        return false;
+    if (registry.user_count < 1 || registry.user_count > 128) return false;
+
+    for (int i = 0; i < registry.user_count && i < 128; i++) {
+        if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
+        if (user_uid(&registry.uinf[i]) != uid) continue;
+        *out = registry.uinf[i];
+        memset(out->password, 0, sizeof(out->password));
+        return true;
+    }
+    return false;
+}
+
 static bool write_first_user_registry(const char *username, const char *password)
 {
     if (username == NULL || password == NULL) return false;
@@ -240,6 +317,13 @@ static bool write_first_user_registry(const char *username, const char *password
 
     vfs_resize(file, 0);
     size_t wrote = vfs_write(file, &registry, 0, sizeof(registry));
+    /* The registry contains password material; only Root/auth helpers may
+       read it. Login/getty run as Root until authentication succeeds. */
+    if (wrote == sizeof(registry))
+    {
+        vfs_chown(file, 0, 0);
+        vfs_chmod(file, 0600);
+    }
     vfs_close(file);
     return wrote == sizeof(registry);
 }
@@ -261,14 +345,22 @@ static void set_current_user_from_info(UserInfo *info)
     permissions_session_publish(current_user);
 }
 
+static void user_session_bind_current_process()
+{
+    tcb_t task = get_current_task();
+    if (task == NULL || task->parent_group == NULL || current_user == NULL) return;
+    permissions_process_switch_identity(task->parent_group, current_user);
+}
+
 bool user_session_is_ready()
 {
     return __atomic_load_n(&user_session_ready_flag, __ATOMIC_ACQUIRE) != 0;
 }
 
 // 导出用户态会话原语，供 ime-kmod 使用。
+// create_user_process_from_file 仅供内核内部（PID1/runfile）使用，不导出：
+// 模块启动进程应走 syscall/RUN 路径，内核不对外承诺进程创建 ABI。
 EXPORT_SYMBOL(user_session_is_ready);
-EXPORT_SYMBOL(create_user_process_from_file);
 EXPORT_SYMBOL_OBJECT(current_user);
 
 void user_session_set_ready(bool ready)
@@ -321,6 +413,51 @@ int user_session_list(UserInfo *out, int max_count)
     return copied;
 }
 
+int user_session_check_password(const char *username, const char *password)
+{
+    if (username == NULL || password == NULL || username[0] == '\0') return -EINVAL;
+
+    static spin_t lock = SPIN_INIT;
+    static uint64_t retry_after_ns = 0;
+    static unsigned failed_attempts = 0;
+
+    spin_lock(&lock);
+    uint64_t now = nanoTime();
+    if (now < retry_after_ns) { spin_unlock(&lock); return -EAGAIN; }
+    spin_unlock(&lock);
+
+    UserRegisterList registry;
+    size_t           bytes_read = 0;
+
+    load_user_registry(&registry, &bytes_read);
+    if (user_registry_needs_oobe(&registry, bytes_read)) return -ENOENT;
+
+    for (int i = 1; i < registry.user_count && i < 128; i++)
+    {
+        if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
+        if (strcmp(username, registry.uinf[i].name) != 0) continue;
+        if (strcmp(password, registry.uinf[i].password) != 0)
+        {
+            spin_lock(&lock);
+            failed_attempts++;
+            uint64_t delay_seconds = 1ULL << min(failed_attempts, 5U);
+            retry_after_ns = now + delay_seconds * 1000000000ULL;
+            spin_unlock(&lock);
+            return -EACCES;
+        }
+        spin_lock(&lock);
+        failed_attempts = 0;
+        retry_after_ns = 0;
+        spin_unlock(&lock);
+        return 0;
+    }
+    spin_lock(&lock);
+    failed_attempts++;
+    retry_after_ns = now + (1ULL << min(failed_attempts, 5U)) * 1000000000ULL;
+    spin_unlock(&lock);
+    return -ENOENT;
+}
+
 int user_session_login(const char *username, const char *password)
 {
     if (username == NULL || password == NULL || username[0] == '\0') return -EINVAL;
@@ -335,6 +472,7 @@ int user_session_login(const char *username, const char *password)
 
     UserRegisterList registry;
     size_t           bytes_read = 0;
+
     load_user_registry(&registry, &bytes_read);
     if (user_registry_needs_oobe(&registry, bytes_read)) return -ENOENT;
 
@@ -359,6 +497,10 @@ int user_session_login(const char *username, const char *password)
         retry_after_ns = 0;
         spin_unlock(&login_lock);
         if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
+        /* login(1) semantics: the authenticator process drops to the account
+           identity before exec'ing the shell/console host. */
+        user_session_set_ready(true);
+        user_session_bind_current_process();
         return 0;
     }
     spin_lock(&login_lock);
@@ -404,6 +546,8 @@ int user_session_create_first(const char *username, const char *password)
             {
                 set_current_user_from_info(first_user);
                 if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
+                user_session_set_ready(true);
+                user_session_bind_current_process();
                 return 0;
             }
         }
@@ -419,6 +563,8 @@ int user_session_create_first(const char *username, const char *password)
     strncpy(info.password, password, sizeof(info.password) - 1);
     info.user_type = XUT_Admin;
     set_current_user_from_info(&info);
+    user_session_set_ready(true);
+    user_session_bind_current_process();
     return 0;
 }
 
@@ -923,6 +1069,22 @@ int create_user_process_from_file_as(char *path, pcb_t pcb, char *argv[], int cr
     char  process_name[32];
     void *entry;
     int   argc = 0;
+
+    /* DAC: exec requires the execute bit, not just read. Root is still
+       subject to the "at least one x bit" rule (Unix semantics). */
+    vfs_node_t exe = vfs_open(path);
+    if (exe == NULL)
+    {
+        write_serial_fmt("Create User Process Failed. Reason: Cannot Open File.\n");
+        return -ENOENT;
+    }
+    bool exec_allowed = vfs_check_access(exe, path, VFS_ACCESS_EXEC);
+    vfs_close(exe);
+    if (!exec_allowed)
+    {
+        write_serial_fmt("Create User Process Failed. Reason: Not Executable.\n");
+        return -EACCES;
+    }
 
     get_thread_name_from_filepath(path, process_name);
 

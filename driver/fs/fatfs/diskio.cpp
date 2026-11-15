@@ -79,7 +79,7 @@ static DRESULT fatfs_cache_fill(byte pdrv, LBA_t sector, uint min_count)
     if (to_read > remaining) to_read = (uint)remaining;
 
     size_t bytes = (size_t)to_read * 0x200;
-    size_t got   = vfs_read(node, cache->data, sector * 0x200, bytes);
+    size_t got   = vfs_read_raw(node, cache->data, sector * 0x200, bytes);
     if (got != bytes) {
         cache->valid = false;
         return RES_ERROR;
@@ -142,7 +142,7 @@ DRESULT disk_read(byte  pdrv,   /* Physical drive nmuber to identify the drive *
 
     fatfs_cache_invalidate(pdrv);
     size_t expected = (size_t)count * 0x200;
-    size_t got      = vfs_read(node, buff, sector * 0x200, expected);
+    size_t got      = vfs_read_raw(node, buff, sector * 0x200, expected);
     if (got != expected) {
         write_serial_fmt("FATFS: disk_read failed pdrv=%u sector=%llu count=%u expected=%zu got=%zu\n", pdrv,
                          (uint64_t)sector, count, expected, got);
@@ -167,7 +167,7 @@ DRESULT disk_write(byte        pdrv,   /* Physical drive nmuber to identify the 
     DRESULT res = RES_PARERR;
     if (!fatfs_get_node_by_number(pdrv)) return RES_PARERR;
     fatfs_cache_invalidate(pdrv);
-    if (vfs_write(fatfs_get_node_by_number(pdrv), (void *)buff, sector * 0x200, count * 0x200) != count * 0x200) {
+    if (vfs_write_raw(fatfs_get_node_by_number(pdrv), (const void *)buff, sector * 0x200, count * 0x200) != count * 0x200) {
         return RES_ERROR;
     }
     res = RES_OK;

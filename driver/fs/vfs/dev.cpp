@@ -7,6 +7,7 @@
 #include "device.h"
 #include "errno.h"
 #include "fs/partition.h"
+#include <x3tp.h>
 #include <ioctl.h>
 // #include "kprint.h"
 #include "krlibc.h"
@@ -56,7 +57,23 @@ static errno_t devfs_register0(const char *path, size_t id) {
     handle->device = device;
     handle->name   = strdup(device->drive_name);
     node->rdev     = device->vdiskid;
-    vfs_child_append(node, device->drive_name, handle);
+    vfs_node_t child = vfs_child_append(node, device->drive_name, handle);
+    if (child != NULL) {
+        // Keep type = file_none so the first lookup still runs devfs_open()
+        // (that is what fills type/size from the device). Only DAC attributes
+        // are stamped here.
+        child->owner = 0;
+        child->group = device->type == DEVICE_FB ? 2 /* XUT_Admin */ : 0;
+        child->rdev  = device->vdiskid;
+        // Raw block devices are root-only. The scanout is writable by the
+        // Admin-owned console host (group Admin, 0660) so a framebuffer
+        // terminal does not need to run the whole shell as root. Stream
+        // devices (tty/console) are world read/write like Unix /dev/tty.
+        vfs_node_set_mode(child,
+                          device->type == DEVICE_BLOCK ? 0600
+                          : device->type == DEVICE_FB ? 0660
+                                                      : 0666);
+    }
     llist_append(&parent->child, &handle->curr);
     vfs_close(node);
     free(buf);
@@ -64,7 +81,7 @@ static errno_t devfs_register0(const char *path, size_t id) {
 }
 
 static errno_t devfs_mount(const char *handle, vfs_node_t node) {
-    if ((uint64_t)handle != DEVFS_REGISTER_ID) return VFS_STATUS_FAILED;
+    (void)handle; // vfs_mount_virtual() 已按注册 ID 选中本文件系统
     if (root_handle == NULL) {
         root_handle         =  (device_handle_t)calloc(1, sizeof(struct device_handle));
         root_handle->device = NULL;
@@ -77,6 +94,9 @@ static errno_t devfs_mount(const char *handle, vfs_node_t node) {
     node->fsid   = devfs_id;
     node->handle = root_handle;
     node->dev    = 0;
+    node->owner  = 0;
+    node->group  = 0;
+    vfs_node_set_mode(node, 0755);
     devfs_root   = node;
 
     for (size_t i = 0; i < 256; i++) {
@@ -173,12 +193,15 @@ size_t devfs_read(void *file, void *addr, size_t offset, size_t size) {
         if (bounce == NULL) {
             return VFS_STATUS_FAILED;
         }
-        size_t got = device.read(device.vdiskid, bounce, size, offset);
-        if (got != (size_t)VFS_STATUS_FAILED) {
-            memcpy(addr, bounce, got);
+        // Stream reads may report a negative errno (e.g. -EAGAIN from
+        // /dev/console when the seat ring is empty); pass it through
+        // untouched and only copy real payload bytes.
+        ssize_t got = (ssize_t)device.read(device.vdiskid, bounce, size, offset);
+        if (got > 0) {
+            memcpy(addr, bounce, (size_t)got);
         }
         free(bounce);
-        return got;
+        return (size_t)got;
     }
     if (offset > device.size)
     {
@@ -239,7 +262,9 @@ static vfs_node_t devfs_dup(vfs_node_t node) {
     new_node->size        = node->size;
     new_node->child       = node->child;
     new_node->flags       = node->flags;
-    new_node->permissions = node->permissions;
+    vfs_node_set_mode(new_node, vfs_node_mode(node));
+    new_node->owner       = node->owner;
+    new_node->group       = node->group;
     new_node->realsize    = node->realsize;
     return new_node;
 }
@@ -257,6 +282,8 @@ static void *devfs_map(void *file, void *addr, size_t offset, size_t size, size_
                        size_t flags) {
     device_handle_t handle =  (device_handle_t)file;
     if (handle->device->flag == 0) return NULL;
+    // Framebuffer mappings always start at the beginning of the scanout.
+    if (handle->device->type == DEVICE_FB && offset != 0) return NULL;
     if (handle->device->map) { return handle->device->map(handle->device->vdiskid, addr, size); }
     return NULL;
 }
@@ -295,7 +322,7 @@ void devfs_setup() {
         write_serial_fmt("'dev' handle is null.");
         return;
     }
-    if (vfs_mount((char*)DEVFS_REGISTER_ID, dev) == VFS_STATUS_FAILED) {
+    if (vfs_mount_virtual(DEVFS_REGISTER_ID, dev) == VFS_STATUS_FAILED) {
         write_serial_fmt("Cannot mount device file system.");
         return;
     }
@@ -329,4 +356,63 @@ errno_t devfs_register(const char *path, size_t id) {
     device->path     = path != NULL ? strdup(path) : NULL;
     if (devfs_root == NULL) { return EOK; }
     return devfs_register0(device->path, id);
+}
+
+/* ------------------------------------------------------------------------ */
+/* /dev/console — Input Core v2 seat0 endpoint                              */
+/* ------------------------------------------------------------------------ */
+
+static size_t console_dev_read(int drive, uint8_t *buffer, size_t number, size_t lba) {
+    (void)drive;
+    (void)lba;
+    return (size_t)x3tp_console_read(buffer, number);
+}
+
+static size_t console_dev_write(int drive, uint8_t *buffer, size_t number, size_t lba) {
+    (void)drive;
+    (void)buffer;
+    (void)number;
+    (void)lba;
+    /* v1 has no console write surface: committed text is produced by the
+       console host through the PTY, never by writing to the input endpoint. */
+    return (size_t)-ENOSYS;
+}
+
+static int console_dev_ioctl(device_t *device, size_t request, void *arg) {
+    (void)device;
+    (void)request;
+    (void)arg;
+    return -ENOTTY;
+}
+
+static int console_dev_poll(size_t events) {
+    return x3tp_console_poll(events);
+}
+
+void x3tp_console_device_init(void) {
+    device_t dev = {};
+    dev.type        = DEVICE_STREAM;
+    strcpy(dev.drive_name, "console");
+    dev.flag        = 1;
+    dev.sector_size = 1;
+    dev.size        = (size_t)-1;
+    dev.read        = console_dev_read;
+    dev.write       = console_dev_write;
+    dev.ioctl       = console_dev_ioctl;
+    dev.poll        = console_dev_poll;
+    dev.map         = (mapf)empty;
+
+    int id = regist_device(NULL, dev);
+    if (id < 0) {
+        write_serial_string("input: /dev/console registration failed\n");
+        return;
+    }
+
+    vfs_node_t node = vfs_open("/dev/console");
+    if (node != NULL) {
+        // root:Admin 0660 — the Admin-owned console host reads it, Visitor does not.
+        vfs_chown(node, 0, 2 /* XUT_Admin */);
+        vfs_chmod(node, 0660);
+        vfs_close(node);
+    }
 }
