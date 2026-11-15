@@ -140,6 +140,12 @@ void screen_capture_register_mapping()
 {
     pcb_t process = caller_process();
     if (!process) return;
+    // Root and System are already trusted with the scanout. The console host
+    // maps /dev/fb0 as root at boot; registering that mapping would make
+    // SetSecret fail with -EBUSY forever over a mapping the kernel cannot and
+    // need not revoke. Only untrusted mappings reserve capture mode.
+    UserType type = process->permission_user.user_type;
+    if (type == XUT_Root || type == XUT_System) return;
     // Called while the capture gate excludes SetSecret. Raw mappings remain
     // readable without a syscall; retain the reservation until their process exits.
     spin_lock(&state_lock);

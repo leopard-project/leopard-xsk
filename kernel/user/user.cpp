@@ -25,6 +25,9 @@
 #include <user/runfile.h>
 #include <cpu/lock.h>
 #include <cpu/regio.h>
+#include <crypto/sha256.h>
+#include <pty.h>
+#include <rng.h>
 
 char *current_user_envp[100] = {
     ENVP_SYSTEM_VERSION,
@@ -41,6 +44,120 @@ UserInfo root_user = {
     .envp = current_user_envp,
     .envc = 3,
 };
+
+/*
+ * Password storage in UserInfo.password[64] (layout unchanged on disk):
+ *
+ *   [0..3]   magic "XSH1"
+ *   [4..7]   uint32_t little-endian PBKDF2 iteration count
+ *   [8..23]  16-byte random salt from the kernel RNG
+ *   [24..55] 32-byte PBKDF2-HMAC-SHA256 derived key
+ *   [56..63] zero
+ *
+ * Anything that does not begin with "XSH1" is a legacy plaintext entry. It is
+ * still accepted (constant-time compare) and rewritten as a hash after the
+ * next successful login. check_password() never writes.
+ */
+#define USER_PASSWORD_HASH_ITER_OFFSET   4
+#define USER_PASSWORD_HASH_SALT_OFFSET   8
+#define USER_PASSWORD_HASH_DIGEST_OFFSET 24
+#define USER_PASSWORD_SALT_SIZE          16
+#define USER_PASSWORD_DIGEST_SIZE        32
+#define USER_PASSWORD_ITERATIONS         50000U
+#define USER_PASSWORD_MIN_ITERATIONS     1000U
+#define USER_PASSWORD_MAX_ITERATIONS     1000000U
+
+static const uint8_t user_password_hash_magic[4] = {'X', 'S', 'H', '1'};
+
+/* Secure zero: volatile stores survive dead-store elimination. */
+static void user_secure_zero(void *buffer, size_t length)
+{
+    volatile uint8_t *p = (volatile uint8_t *)buffer;
+    while (length-- != 0) *p++ = 0;
+}
+
+static void user_store_le32(uint8_t *out, uint32_t value)
+{
+    out[0] = (uint8_t)(value & 0xFFU);
+    out[1] = (uint8_t)((value >> 8) & 0xFFU);
+    out[2] = (uint8_t)((value >> 16) & 0xFFU);
+    out[3] = (uint8_t)((value >> 24) & 0xFFU);
+}
+
+static uint32_t user_load_le32(const uint8_t *in)
+{
+    return (uint32_t)in[0] | ((uint32_t)in[1] << 8) | ((uint32_t)in[2] << 16) | ((uint32_t)in[3] << 24);
+}
+
+static bool user_digest_equal(const uint8_t *a, const uint8_t *b, size_t length)
+{
+    uint8_t diff = 0;
+    for (size_t i = 0; i < length; i++) diff |= (uint8_t)(a[i] ^ b[i]);
+    return diff == 0;
+}
+
+static bool user_password_is_hashed(const UserInfo *entry)
+{
+    return entry != NULL && memcmp(entry->password, user_password_hash_magic, sizeof(user_password_hash_magic)) == 0;
+}
+
+/* Legacy plaintext compare. Length is fixed-length over the field, content in
+   constant time; the loop never reads past either string's terminator. */
+static bool user_password_plain_equal(const char *candidate, const UserInfo *entry)
+{
+    if (candidate == NULL || entry == NULL) return false;
+
+    size_t candidate_length = strlen(candidate);
+    size_t stored_length = 0;
+    while (stored_length + 1 < sizeof(entry->password) && entry->password[stored_length] != '\0')
+        stored_length++;
+
+    size_t length = candidate_length < stored_length ? candidate_length : stored_length;
+    uint32_t diff = (uint32_t)(candidate_length ^ stored_length);
+    for (size_t i = 0; i < length; i++)
+        diff |= (uint32_t)(uint8_t)(candidate[i] ^ entry->password[i]);
+    return diff == 0;
+}
+
+static bool user_password_make_hash(const char *password, uint8_t out[64])
+{
+    if (password == NULL || out == NULL) return false;
+
+    uint8_t salt[USER_PASSWORD_SALT_SIZE];
+    get_random_bytes(salt, sizeof(salt));
+
+    memcpy(out, user_password_hash_magic, sizeof(user_password_hash_magic));
+    user_store_le32(out + USER_PASSWORD_HASH_ITER_OFFSET, USER_PASSWORD_ITERATIONS);
+    memcpy(out + USER_PASSWORD_HASH_SALT_OFFSET, salt, sizeof(salt));
+    pbkdf2_hmac_sha256(password, strlen(password), salt, sizeof(salt), USER_PASSWORD_ITERATIONS,
+                       out + USER_PASSWORD_HASH_DIGEST_OFFSET, USER_PASSWORD_DIGEST_SIZE);
+    memset(out + USER_PASSWORD_HASH_DIGEST_OFFSET + USER_PASSWORD_DIGEST_SIZE, 0,
+           sizeof(((UserInfo *)0)->password) - (USER_PASSWORD_HASH_DIGEST_OFFSET + USER_PASSWORD_DIGEST_SIZE));
+
+    user_secure_zero(salt, sizeof(salt));
+    return true;
+}
+
+/* Hashed entries verify with PBKDF2; legacy entries with a constant-time
+   plaintext compare. Out-of-range iteration counts are a failed login, never a
+   long-running loop. */
+static bool user_password_verify(const UserInfo *entry, const char *password)
+{
+    if (entry == NULL || password == NULL) return false;
+    if (!user_password_is_hashed(entry)) return user_password_plain_equal(password, entry);
+
+    uint32_t iterations = user_load_le32((const uint8_t *)entry->password + USER_PASSWORD_HASH_ITER_OFFSET);
+    if (iterations < USER_PASSWORD_MIN_ITERATIONS || iterations > USER_PASSWORD_MAX_ITERATIONS) return false;
+
+    uint8_t digest[USER_PASSWORD_DIGEST_SIZE];
+    pbkdf2_hmac_sha256(password, strlen(password),
+                       (const uint8_t *)entry->password + USER_PASSWORD_HASH_SALT_OFFSET,
+                       USER_PASSWORD_SALT_SIZE, iterations, digest, sizeof(digest));
+    bool ok = user_digest_equal(digest, (const uint8_t *)entry->password + USER_PASSWORD_HASH_DIGEST_OFFSET,
+                                sizeof(digest));
+    user_secure_zero(digest, sizeof(digest));
+    return ok;
+}
 
 static uint32_t stable_user_name_id(const char *name)
 {
@@ -189,7 +306,11 @@ static bool user_registry_first_user_matches(const UserRegisterList *registry, c
     for (int i = 1; i < registry->user_count; i++)
     {
         if (!user_registry_login_entry_valid(&registry->uinf[i])) continue;
-        return strcmp(username, registry->uinf[i].name) == 0 && strcmp(password, registry->uinf[i].password) == 0;
+        /* Only the first login entry is the OOBE account: an earlier name
+           mismatch must not fall through to a later user. Hashed (XSH1) and
+           legacy plaintext both verify in constant time. */
+        return strcmp(username, registry->uinf[i].name) == 0 &&
+               user_password_verify(&registry->uinf[i], password);
     }
     return false;
 }
@@ -290,9 +411,11 @@ bool user_identity_from_uid(uint32_t uid, UserInfo *out)
     return false;
 }
 
-static bool write_first_user_registry(const char *username, const char *password)
+/* Write a full registry image. Used for OOBE creation and for the transparent
+   plaintext -> hash upgrade on a successful login. */
+static bool user_registry_store(const UserRegisterList *registry)
 {
-    if (username == NULL || password == NULL) return false;
+    if (registry == NULL) return false;
 
     vfs_mkdir("/system");
     vfs_mkdir("/system/config");
@@ -305,6 +428,38 @@ static bool write_first_user_registry(const char *username, const char *password
     }
     if (file == NULL) return false;
 
+    vfs_resize(file, 0);
+    /* vfs_write() takes void *; the registry is only read here. */
+    size_t wrote = vfs_write(file, (void *)registry, 0, sizeof(*registry));
+    /* The registry contains password material; only Root/auth helpers may
+       read it. Login/getty run as Root until authentication succeeds. */
+    if (wrote == sizeof(*registry))
+    {
+        vfs_chown(file, 0, 0);
+        vfs_chmod(file, 0600);
+    }
+    vfs_close(file);
+    return wrote == sizeof(*registry);
+}
+
+/* Replace a legacy plaintext password with a salted hash and persist. The
+   caller must have authenticated the entry first. */
+static bool user_registry_migrate_password(UserRegisterList *registry, int index, const char *password)
+{
+    if (registry == NULL || password == NULL || index < 1 || index >= 128) return false;
+    if (user_password_is_hashed(&registry->uinf[index])) return true;
+
+    uint8_t hash[sizeof(((UserInfo *)0)->password)];
+    if (!user_password_make_hash(password, hash)) return false;
+    memcpy(registry->uinf[index].password, hash, sizeof(hash));
+    user_secure_zero(hash, sizeof(hash));
+    return user_registry_store(registry);
+}
+
+static bool write_first_user_registry(const char *username, const char *password)
+{
+    if (username == NULL || password == NULL) return false;
+
     UserRegisterList registry;
     memset(&registry, 0, sizeof(registry));
     registry.user_count = 2;
@@ -312,20 +467,16 @@ static bool write_first_user_registry(const char *username, const char *password
     strcpy(registry.uinf[0].password, "");
     registry.uinf[0].user_type = XUT_Root;
     strncpy(registry.uinf[1].name, username, sizeof(registry.uinf[1].name) - 1);
-    strncpy(registry.uinf[1].password, password, sizeof(registry.uinf[1].password) - 1);
     registry.uinf[1].user_type = XUT_Admin;
 
-    vfs_resize(file, 0);
-    size_t wrote = vfs_write(file, &registry, 0, sizeof(registry));
-    /* The registry contains password material; only Root/auth helpers may
-       read it. Login/getty run as Root until authentication succeeds. */
-    if (wrote == sizeof(registry))
-    {
-        vfs_chown(file, 0, 0);
-        vfs_chmod(file, 0600);
-    }
-    vfs_close(file);
-    return wrote == sizeof(registry);
+    /* Never store the plaintext password; Root's entry stays empty because
+       login only accepts entries 1..user_count-1. */
+    uint8_t hash[sizeof(((UserInfo *)0)->password)];
+    if (!user_password_make_hash(password, hash)) return false;
+    memcpy(registry.uinf[1].password, hash, sizeof(hash));
+    user_secure_zero(hash, sizeof(hash));
+
+    return user_registry_store(&registry);
 }
 
 static void set_current_user_from_info(UserInfo *info)
@@ -335,7 +486,8 @@ static void set_current_user_from_info(UserInfo *info)
     if (current_user == NULL) return;
     memset(current_user, 0, sizeof(UserInfo));
     strcpy(current_user->name, info->name);
-    strcpy(current_user->password, info->password);
+    /* No credential material in the session identity: verification always
+       reads the registry, and current_user is exported to modules. */
     current_user->user_type = info->user_type;
     current_user->user_prms = info->user_prms;
     if (current_user->user_type != XUT_Custom && user_permission_mask(current_user->user_prms) == 0)
@@ -349,7 +501,14 @@ static void user_session_bind_current_process()
 {
     tcb_t task = get_current_task();
     if (task == NULL || task->parent_group == NULL || current_user == NULL) return;
+
     permissions_process_switch_identity(task->parent_group, current_user);
+
+    /* Hand the controlling PTY to the authenticated identity: owner rw,
+       group write. getty is root at this point; the shell that execs next
+       inherits the same session. */
+    pty_set_controlling_owner(task->parent_group->sid,
+                              user_uid(current_user), user_gid(current_user));
 }
 
 bool user_session_is_ready()
@@ -436,7 +595,7 @@ int user_session_check_password(const char *username, const char *password)
     {
         if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
         if (strcmp(username, registry.uinf[i].name) != 0) continue;
-        if (strcmp(password, registry.uinf[i].password) != 0)
+        if (!user_password_verify(&registry.uinf[i], password))
         {
             spin_lock(&lock);
             failed_attempts++;
@@ -449,6 +608,11 @@ int user_session_check_password(const char *username, const char *password)
         failed_attempts = 0;
         retry_after_ns = 0;
         spin_unlock(&lock);
+        /* doas runs as root and has just proven the password: upgrade a
+           legacy plaintext entry here too, so a doas-only session also
+           removes the plaintext from disk. Persistence failure is ignored. */
+        if (!user_password_is_hashed(&registry.uinf[i]))
+            (void)user_registry_migrate_password(&registry, i, password);
         return 0;
     }
     spin_lock(&lock);
@@ -480,7 +644,7 @@ int user_session_login(const char *username, const char *password)
     {
         if (!user_registry_login_entry_valid(&registry.uinf[i])) continue;
         if (strcmp(username, registry.uinf[i].name) != 0) continue;
-        if (strcmp(password, registry.uinf[i].password) != 0)
+        if (!user_password_verify(&registry.uinf[i], password))
         {
             spin_lock(&login_lock);
             failed_attempts++;
@@ -489,6 +653,12 @@ int user_session_login(const char *username, const char *password)
             spin_unlock(&login_lock);
             return -EACCES;
         }
+
+        /* Successful authentication: upgrade a legacy plaintext entry in
+           place. Failure to persist must not block the login; the plaintext
+           entry simply stays until a later successful login retries. */
+        if (!user_password_is_hashed(&registry.uinf[i]))
+            (void)user_registry_migrate_password(&registry, i, password);
 
         user_session_set_ready(false);
         set_current_user_from_info(&registry.uinf[i]);
@@ -533,18 +703,22 @@ int user_session_create_first(const char *username, const char *password)
     {
         if (user_registry_first_user_matches(&registry, username, password))
         {
-            UserInfo *first_user = NULL;
+            int first_index = -1;
             for (int i = 1; i < registry.user_count && i < 128; i++)
             {
                 if (user_registry_login_entry_valid(&registry.uinf[i]))
                 {
-                    first_user = &registry.uinf[i];
+                    first_index = i;
                     break;
                 }
             }
-            if (first_user != NULL)
+            if (first_index >= 0)
             {
-                set_current_user_from_info(first_user);
+                /* Re-authentication of the OOBE account: upgrade a legacy
+                   plaintext entry, then bind the session. */
+                if (!user_password_is_hashed(&registry.uinf[first_index]))
+                    (void)user_registry_migrate_password(&registry, first_index, password);
+                set_current_user_from_info(&registry.uinf[first_index]);
                 if (current_user == NULL || !init_user_profile(current_user->name)) return -EIO;
                 user_session_set_ready(true);
                 user_session_bind_current_process();
@@ -557,10 +731,11 @@ int user_session_create_first(const char *username, const char *password)
     if (user_registry_has_real_user(&registry)) return -EEXIST;
     if (!write_first_user_registry(username, password) || !init_user_profile(username)) return -EIO;
 
+    /* The registry now holds the hash; the in-memory identity must not keep
+       the plaintext password. */
     UserInfo info;
     memset(&info, 0, sizeof(info));
     strncpy(info.name, username, sizeof(info.name) - 1);
-    strncpy(info.password, password, sizeof(info.password) - 1);
     info.user_type = XUT_Admin;
     set_current_user_from_info(&info);
     user_session_set_ready(true);

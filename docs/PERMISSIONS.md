@@ -57,6 +57,9 @@ VFS 访问钩子。`kernel/main.cpp` 在 `permissions_init("/system/config/permi
   创建/删除/rename 检查的是父目录 `w|x`，不是子文件自身；
 - `chmod` 仅 owner 或 Root；非 Root 设置的 setuid/setgid 会被清掉；
   `chown` 仅 Root，非 Root 只能把自己的文件换到自己的组，改属主会清 setuid/setgid；
+- 非 Root 进程对普通文件执行 `write/pwrite/writev/ftruncate/copy_file_range/
+  sendfile/O_TRUNC` 后，内核清除该文件的 `S_ISUID/S_ISGID`（Unix 语义）；
+  管道、socket、设备节点不做该处理；
 - `exec` 在 `create_user_process_from_file_as()` 中单独检查 `VFS_ACCESS_EXEC`，
   可读但无 x 位的文件不能执行；`mount` 等价于 `CAP_SYS_ADMIN`，只允许 Root/System，
   Admin 不能把自制文件系统叠到 `/system` 上；
@@ -69,7 +72,15 @@ VFS 访问钩子。`kernel/main.cpp` 在 `permissions_init("/system/config/permi
 - 新节点默认 `0777/0666 & ~umask`，`umask` 默认 `022`；owner = 当前身份，
   group = 父目录 setgid 或当前身份；ext4 把这些值写进持久 inode，
   tmpfs 存在 entry 里，FAT 统一为 `root:root 0755/0644`；
-- `/tmp` 由 tmpfs 挂载为 `root:root 01777`；`/dev` 块设备 `0600`、流设备 `0666`。
+- `/tmp` 由 tmpfs 挂载为 `root:root 01777`；`/dev` 块设备 `0600`、流设备 `0666`；
+  `/dev/console` 与 `/dev/fb0` 例外，都是 `root:root 0600`；
+- PTY slave 不是世界设备：创建者身份、`TIOCSCTTY` 会话身份、登录后的
+  `pty_set_controlling_owner()` 三段决定 owner/group；最终是 `0620`（或 `0600`），
+  `/dev/ptmx` 保持 `0666`；
+- 登录密码在 `/system/config/usereg.dat` 中以 `XSH1` 记录：
+  `[magic 4][iterations LE32][salt 16][PBKDF2-HMAC-SHA256 32]`，默认 50000 次；
+  旧明文条目在成功登录（或 doas 校验）后原地升级；`current_user`/用户列表/
+  权限身份副本都不携带密码。
 
 过渡期 `permissions_file_access()` 采用 **DAC 与路径策略同时允许**：路径规则继续提供
 `/users` 家目录隔离，直到镜像/包安装的 owner/mode 全部就绪；后续可把路径策略退化为

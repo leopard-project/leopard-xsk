@@ -130,6 +130,8 @@ void *fb_map(int drive, void *addr, size_t len)
     // A live raw framebuffer mapping is readable without further syscalls.
     // The kernel text console must stop drawing into the same scanout; kernel
     // logs continue on serial while the user-space console host owns the fb.
+    // Registration is a no-op for trusted root/System mappings (such as the
+    // console host's boot-time map), which do not reserve secret capture mode.
     console_suspend_fb();
     screen_capture_register_mapping();
     return addr;

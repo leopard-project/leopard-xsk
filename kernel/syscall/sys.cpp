@@ -221,6 +221,24 @@ static uint32_t current_gid()
     return user_gid(task_effective_user());
 }
 
+/* 非 Root 进程修改普通文件内容后清除 setuid/setgid（Unix 语义）：
+   否则一个可写的提权二进制在内容被改写后仍会保留特权。
+   只作用于普通文件；清位是副作用，chmod 失败不改变系统调用返回值。 */
+static void drop_file_setid_bits(vfs_node_t node)
+{
+    if (node == NULL || current_uid() == 0) return;
+
+    const uint32_t non_regular = file_dir | file_block | file_stream | file_symlink |
+                                 file_fbdev | file_keyboard | file_mouse | file_pipe |
+                                 file_socket | file_epoll | file_ptmx | file_pts |
+                                 file_proxy;
+    if (!(node->type & file_none) || (node->type & non_regular) != 0) return;
+
+    uint32_t mode = vfs_node_mode(node);
+    if ((mode & 06000U) == 0) return;
+    (void)vfs_chmod(node, mode & ~06000U);
+}
+
 /* DAC 属性修改授权：chmod 仅 owner/Root；chown 仅 Root，
    非 Root 只能把自己的文件换到自己的组。 */
 static bool may_chmod_node(vfs_node_t node)
@@ -757,6 +775,7 @@ next:
             free(normalized_path);
             return SYSCALL_FAULT_(EIO);
         }
+        drop_file_setid_bits(node);
     }
 
     fd_file_handle *fd_handle = (fd_file_handle *)calloc(1, sizeof(fd_file_handle));
@@ -883,10 +902,12 @@ sys_(write, int fd, uint8_t *buffer, size_t size)
     {
         int64_t ret = write_from_user_buffer(handle, buffer, size, true);
         if (ret < 0) return SYSCALL_FAULT_((int)-ret);
+        if (ret > 0) drop_file_setid_bits(handle->node);
         return (uint64_t)ret;
     }
     int64_t ret = write_from_user_buffer(handle, buffer, size, false);
     if (ret < 0) return SYSCALL_FAULT_((int)-ret);
+    if (ret > 0) drop_file_setid_bits(handle->node);
     return (uint64_t)ret;
 }
 
@@ -1806,13 +1827,19 @@ sys_(writev, int fd, struct iovec *iov, int iovcnt)
         struct iovec kiov;
         if (!copy_from_user_pagedir(pagedir, &kiov, &iov[i], sizeof(kiov)))
         {
+            if (total > 0) drop_file_setid_bits(handle->node);
             return total > 0 ? total : SYSCALL_FAULT_(EFAULT);
         }
         int64_t status = write_from_user_buffer(handle, (const uint8_t *)kiov.iov_base, kiov.iov_len, false);
-        if (status < 0) return total > 0 ? total : SYSCALL_FAULT_((int)-status);
+        if (status < 0)
+        {
+            if (total > 0) drop_file_setid_bits(handle->node);
+            return total > 0 ? total : SYSCALL_FAULT_((int)-status);
+        }
         if (!checked_add_size(total, (size_t)status, &total)) return SYSCALL_FAULT_(EINVAL);
         if ((size_t)status < kiov.iov_len) break;
     }
+    if (total > 0) drop_file_setid_bits(handle->node);
     return total;
 }
 
@@ -4112,6 +4139,7 @@ sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out
         size_t got = vfs_read(src_handle->node, buffer, src_offset, chunk);
         if (got == (size_t)VFS_STATUS_FAILED)
         {
+            if (copy_total > 0) drop_file_setid_bits(dst_handle->node);
             free(buffer);
             return copy_total > 0 ? copy_total : SYSCALL_FAULT_(EIO);
         }
@@ -4120,6 +4148,7 @@ sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out
         size_t wrote = vfs_write(dst_handle->node, buffer, dst_offset, got);
         if (wrote == (size_t)VFS_STATUS_FAILED)
         {
+            if (copy_total > 0) drop_file_setid_bits(dst_handle->node);
             free(buffer);
             return copy_total > 0 ? copy_total : SYSCALL_FAULT_(EIO);
         }
@@ -4133,6 +4162,7 @@ sys_(copy_file_range, int fd_in, uint64_t *off_in, int fd_out, uint64_t *off_out
     }
 
     vfs_update(dst_handle->node);
+    if (copy_total > 0) drop_file_setid_bits(dst_handle->node);
     free(buffer);
 
     if (off_in != NULL)
@@ -4187,6 +4217,7 @@ sys_(pwrite, int fd, uint8_t *buffer, size_t size, int64_t offset)
     handle->offset = (size_t)offset;
     int64_t ret = write_from_user_buffer(handle, buffer, size, false);
     handle->offset = old_offset;
+    if (ret > 0) drop_file_setid_bits(handle->node);
     return ret < 0 ? SYSCALL_FAULT_((int)-ret) : (uint64_t)ret;
 }
 
@@ -4772,6 +4803,7 @@ sys_(ftruncate, int fd, uint64_t length)
     if (handle->node->type == file_dir) return SYSCALL_FAULT_(EISDIR);
     if (vfs_resize(handle->node, length) != VFS_STATUS_SUCCESS) return SYSCALL_FAULT_(EIO);
     if (handle->offset > length) handle->offset = length;
+    drop_file_setid_bits(handle->node);
     return 0;
 }
 
@@ -5513,6 +5545,7 @@ sys_(sendfile, int out_fd, int in_fd, uint64_t *offset_ptr, size_t count)
         remaining          -= bytes_read;
     }
     free(buffer);
+    if (total_sent > 0) drop_file_setid_bits(out_handle->node);
     if (offset_ptr != NULL) { *offset_ptr = current_offset; }
     else
     {

@@ -41,3 +41,7 @@ void pty_init();
 void pty_detach_controlling(size_t sid, size_t owner_pid);
 int  pty_session_foreground_pgid(size_t sid);
 
+// Re-stamp the slave node after login authenticates: owner rw, group write
+// when gid is known (0620), otherwise owner-only (0600). Never world access.
+void pty_set_controlling_owner(size_t sid, uint32_t uid, uint32_t gid);
+

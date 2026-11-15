@@ -13,7 +13,7 @@ typedef struct
     char          **envp;       // 环境变量指针
     size_t          envc;       // 环境变量数量
     int             fgproc;     // 前台进程
-    char            password[64];   // 用户密码
+    char            password[64];   // 口令：XSH1 PBKDF2-HMAC-SHA256 哈希，或待迁移的 legacy 明文
 } UserInfo;
 
 typedef struct

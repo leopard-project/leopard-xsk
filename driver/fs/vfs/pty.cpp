@@ -11,6 +11,7 @@
 #include <task/pcb.h>
 #include <task/poll.h>
 #include <task/scheduler.h>
+#include <user/user.h>
 
 static int                 ptmx_fsid = 0;
 static int                 pts_fsid  = 0;
@@ -146,11 +147,21 @@ static bool pty_pgid_in_session(int pgid, size_t sid)
 }
 
 // Called with pair->lock held; the caller has already validated sid/pgid.
-static void pts_ctrl_assign(pty_handle_t *pair, size_t sid, size_t pgid, size_t owner_pid)
+// The slave node's DAC follows the session's identity: owner rw, group write
+// when a group is known, otherwise owner-only. Never world read/write.
+static void pts_ctrl_assign(pty_handle_t *pair, size_t sid, size_t pgid, size_t owner_pid,
+                            uint32_t uid, uint32_t gid)
 {
     pair->ctrl_sid       = (int)sid;
     pair->ctrl_pgid      = (int)pgid;
     pair->ctrl_owner_pid = (int)owner_pid;
+
+    if (pair->slave_node != NULL)
+    {
+        pair->slave_node->owner = uid;
+        pair->slave_node->group = gid;
+        vfs_node_set_mode(pair->slave_node, gid != 0 ? 0620 : 0600);
+    }
 }
 
 // Update winsize and notify the foreground pgrp only when it actually changed.
@@ -223,10 +234,19 @@ static void ptmx_open(void *parent, const char *name, vfs_node_t node)
         return;
     }
 
+    // The slave is not a controlling terminal yet. Give it the creator's
+    // identity rather than world access; TIOCSCTTY re-stamps it for the
+    // session that actually owns it. Group write only when a group is known.
+    UserInfo *creator = task_effective_user();
+    uint32_t  uid     = user_uid(creator);
+    uint32_t  gid     = user_gid(creator);
+
     slave->type        = file_pts;
     slave->fsid        = pts_fsid;
     slave->handle      = NULL;
-    slave->mode        = 0666;
+    slave->owner       = uid;
+    slave->group       = gid;
+    vfs_node_set_mode(slave, gid != 0 ? 0620 : 0600);
     slave->size        = (uint64_t)-1;
     pair->slave_node   = slave;
     pair->master_node  = node;
@@ -587,7 +607,8 @@ static void pts_open(void *parent, const char *name, vfs_node_t node)
     node->type   = file_pts;
     node->fsid   = pts_fsid;
     node->size   = (uint64_t)-1;
-    node->mode   = 0666;
+    // Preserve the slave node's owner/group/mode: opening it must not
+    // re-grant world access to another session.
     if (pair->slave_node == NULL) pair->slave_node = node;
     spin_unlock(&pair->lock);
     spin_unlock(&pty_global_lock);
@@ -751,6 +772,10 @@ static errno_t pts_ioctl(void *handle, size_t request, void *arg)
         // arg == 1 explicitly steals one from another session.
         if (caller->pid != caller->sid && flags != 1) return -EPERM;
 
+        UserInfo *identity = task_effective_user();
+        uint32_t  uid      = user_uid(identity);
+        uint32_t  gid      = user_gid(identity);
+
         spin_lock(&pair->lock);
         bool in_use = pair->ctrl_sid != 0 && pair->ctrl_sid != (int)caller->sid;
         if (in_use && flags != 1)
@@ -758,7 +783,7 @@ static errno_t pts_ioctl(void *handle, size_t request, void *arg)
             spin_unlock(&pair->lock);
             return -EPERM;
         }
-        pts_ctrl_assign(pair, caller->sid, caller->pgid, caller->pid);
+        pts_ctrl_assign(pair, caller->sid, caller->pgid, caller->pid, uid, gid);
         spin_unlock(&pair->lock);
         return EOK;
     }
@@ -993,6 +1018,32 @@ void pty_detach_controlling(size_t sid, size_t owner_pid)
     spin_unlock(&pty_global_lock);
 }
 
+void pty_set_controlling_owner(size_t sid, uint32_t uid, uint32_t gid)
+{
+    if (sid == 0) return;
+
+    spin_lock(&pty_global_lock);
+    pty_handle_t *pos;
+    pty_handle_t *n;
+    llist_for_each(pos, n, &ptmx_list_head, list_node)
+    {
+        if (pos->ctrl_sid != (int)sid) continue;
+
+        spin_lock(&pos->lock);
+        // Re-check under the pair lock: ctrl_sid can change without the global
+        // lock. Only plain field writes happen here, no sleeping/allocating.
+        if (pos->ctrl_sid == (int)sid && pos->slave_node != NULL)
+        {
+            pos->slave_node->owner = uid;
+            pos->slave_node->group = gid;
+            vfs_node_set_mode(pos->slave_node, gid != 0 ? 0620 : 0600);
+        }
+        spin_unlock(&pos->lock);
+        break;
+    }
+    spin_unlock(&pty_global_lock);
+}
+
 int pty_session_foreground_pgid(size_t sid)
 {
     if (sid == 0) return -1;
@@ -1046,7 +1097,8 @@ static vfs_node_t pty_open_ctty_node(void)
         node->handle    = pos;
         node->type      = file_pts;
         node->fsid      = pts_fsid;
-        node->mode      = 0666;
+        // Keep the slave node's DAC (owner/group/mode) established by
+        // TIOCSCTTY; resolving /dev/tty must not widen access.
         node->size      = (uint64_t)-1;
         node->refcount++;
         result = node;

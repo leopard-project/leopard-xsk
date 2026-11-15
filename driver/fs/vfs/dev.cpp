@@ -63,15 +63,15 @@ static errno_t devfs_register0(const char *path, size_t id) {
         // (that is what fills type/size from the device). Only DAC attributes
         // are stamped here.
         child->owner = 0;
-        child->group = device->type == DEVICE_FB ? 2 /* XUT_Admin */ : 0;
+        child->group = 0;
         child->rdev  = device->vdiskid;
-        // Raw block devices are root-only. The scanout is writable by the
-        // Admin-owned console host (group Admin, 0660) so a framebuffer
-        // terminal does not need to run the whole shell as root. Stream
-        // devices (tty/console) are world read/write like Unix /dev/tty.
+        // Raw block devices and the scanout are root-only: exposing the
+        // framebuffer to a non-root process would defeat secret capture mode.
+        // Stream devices (tty/console) are world read/write like Unix /dev/tty;
+        // the dedicated /dev/console endpoint is tightened separately below.
         vfs_node_set_mode(child,
                           device->type == DEVICE_BLOCK ? 0600
-                          : device->type == DEVICE_FB ? 0660
+                          : device->type == DEVICE_FB ? 0600
                                                       : 0666);
     }
     llist_append(&parent->child, &handle->curr);
@@ -410,9 +410,9 @@ void x3tp_console_device_init(void) {
 
     vfs_node_t node = vfs_open("/dev/console");
     if (node != NULL) {
-        // root:Admin 0660 — the Admin-owned console host reads it, Visitor does not.
-        vfs_chown(node, 0, 2 /* XUT_Admin */);
-        vfs_chmod(node, 0660);
+        // root:root 0600 — only the trusted console host may read input events.
+        vfs_chown(node, 0, 0);
+        vfs_chmod(node, 0600);
         vfs_close(node);
     }
 }

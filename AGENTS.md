@@ -331,7 +331,7 @@ VKBD write ─┘        └─ 静态路由表 source -> seat -> endpoint
 - `read()` 只返回完整 24 字节记录；空返回 `-EAGAIN`；缓冲区 `<24` 返回 `-EINVAL`。
 - `poll` 对“seat0 任一 ring 非空”返回 `POLLIN`（level-triggered），endpoint
   closed 返回 `EPOLLHUP`。
-- 权限 `root:Admin 0660`（conhost 是 Admin；Visitor 拒绝）。
+- 权限 `root:root 0600`：只有以 root 运行的 conhost 能读；Admin/Visitor 都拒绝。
 - v1 无 write/ioctl：commit text 由 conhost 写 PTY，不写输入端点。
 - 记录布局：`type@0`、`value@4`、`flags@8`、`reserved@12`、`sequence@16`；
   `CHAR=1` / `KEYDOWN=2` / `KEYUP=3`；CHAR 的 `value` 是 `ime_utf8_pack` 的 UTF-8。
@@ -443,8 +443,15 @@ VKBD write ─┘        └─ 静态路由表 source -> seat -> endpoint
 - installer/getty/shell 的业务输出走各自的 terminal view / PTY，由 conhost 渲染。
 
 ### LeopardOS console host / getty
-- 启动链：`rc → conhost → getty → shell`。conhost 拥有 `/dev/console` 与
-  `/dev/fb0`，在 PTY 上启动 getty；getty 登录后 exec shell。
+- 启动链：`rc → conhost → getty → shell`。conhost 以 root 拥有 `/dev/console`
+  与 `/dev/fb0`（两者都是 `root:root 0600`），在 PTY 上启动 getty；getty 登录后
+  exec shell。
+- PTY slave `/dev/pts/N` 不是世界可读写：创建时继承创建者身份，`TIOCSCTTY`
+  按会话身份重新 stamp，登录成功后 `pty_set_controlling_owner()` 改为
+  `<用户>:<gid> 0620`（gid 为 0 时 `0600`）。`/dev/ptmx` 仍为 `0666`。
+- 登录密码只以 `XSH1`（PBKDF2-HMAC-SHA256，16B salt + 32B digest + 迭代数）
+  存在 `/system/config/usereg.dat`（`root:root 0600`）；旧明文条目在成功登录
+  或 doas 校验成功后原地升级。`current_user` 不保存任何密码材料。
 - getty / OOBE 已改为 fd 0/1/2 + termios：使用 `read(0)` 和
   `TCGETS/TCSETS` 的 `ECHO` 开关处理密码，不再使用 `XAPI_INPUT`。
 - conhost 从 `/dev/console` 读 `x3tp_event_t`，写 PTY；IME manager 以 pipe
