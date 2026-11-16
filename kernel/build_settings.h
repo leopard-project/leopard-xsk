@@ -52,7 +52,8 @@
 
 #ifndef CONFIG_KN_VERSION
 // Kernel release string reported by the bootloader/kernel.
-#define CONFIG_KN_VERSION "XSK 2.1.0"
+// tools/gen_ninja.py overrides this from the current git tag.
+#define CONFIG_KN_VERSION "XSK 2.2.1"
 #endif
 
 #ifndef CONFIG_OS_VERSION

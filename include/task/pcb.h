@@ -10,7 +10,6 @@
 #include "stdint.h"
 #include "tty.h"
 #include "user/user.h"
-#include <x3tp.h>
 #include <mm/vma.h>
 #include <syscall/signal.h>
 
@@ -133,7 +132,6 @@ struct process_control_block
     uint64_t brk_current ;
 
     tty_t       *tty;
-    x3tp_terminal_t   *terminal;
 
     int      notify_pcor_pipe_read_fd;
     int      notify_pcor_pipe_write_fd;

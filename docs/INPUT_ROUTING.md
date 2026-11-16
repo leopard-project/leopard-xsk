@@ -1,7 +1,10 @@
-# X3TP — 内核输入/终端标准
+# X3TP — 内核输入事件标准
 
 > 状态：**已实现（2026-11-15）**。取代本文早先的 `input_route_dispatch` + 焦点表 +
 > router 线程方案（保留在文末“历史方案”仅作决策记录）。
+>
+> 2026-11-16：内核 terminal view 与 XAPI 文本 syscall 已移除；文本 I/O 归用户态
+> libc（PTY/termios），内核只保留 event core、`/dev/console` 和 PTY/termios。
 >
 > 代码：`include/x3tp.h`、`kernel/x3tp.cpp`、
 > `driver/fs/vfs/dev.cpp`（`/dev/console`）、`driver/ps2/keyboard.cpp`、
@@ -13,7 +16,7 @@
 - 数据路径**不加 mutex/spinlock**；per-source 单生产者，队列满即丢键。
 - mono-session 优先；multiseat 只加场景表项，IRQ 路径不变。
 - 内核只做“事件搬运”：不做 IME、候选词、词库、终端渲染。
-- 不导出 `x3tp_route_*` / `x3tp_terminal_*`，模块不可见。
+- 不导出 `x3tp_route_*` / `x3tp_console_*`，模块不可见。
 
 ## 数据流
 
@@ -96,26 +99,25 @@ x3tp_route_bind(INPUT_SOURCE_USB, seat_id, endpoint_id);
 只切标志；未来每个座位一个 `/dev/console`（或 seat 文件）即可。
 真正的 seat manager / 热插拔策略属于用户态，内核不实现。
 
-## 与 legacy 路径的关系
+## 与用户态终端的关系
 
-- 旧 XTTTP/XAPI（`xapi_Getch`、`xapi_Input`、`SXAH_*`）仍保留，供 login 和旧应用使用。
-- 独立 `x3tp_terminal_view_t` 模块已删除；它的字节环、行缓冲和 `xapi_Getch` 兼容排空并入
-  X3TP，类型为 `x3tp_terminal_view_t`。`SXAH_MARK_IS_TERMINAL` 只设置 legacy
-  `is_shell`，不注册/切换焦点。
-- `x3tp_terminal_getch()` 在字节环为空时把 seat0 `CHAR` 事件 drain 到调用者自己的
-  `x3tp_terminal_view_t`。这是兼容 drain，不是焦点模型；它与 `/dev/console` 同时读会
-  竞争同一 ring，只应作为过渡期存在。
-- 键盘驱动不再维护 `kb_fifo` / `kb_synth` 第二条队列；`get_keyboard_input()` 直接
-  读当前终端（或 kernel default）的 `x3tp_terminal_view_t`。`xapi_Getch`、`xapi_Input`
-  的 `XAPI_INPUT_NO_ECHO`、`/dev/stdio` 的 legacy 行输入都因此落在同一 X3TP
-  实现上。
-- **重要**：login（`leopard-getty`）读 legacy 队列时，输入核心 ring 仍保留一份
-  平行副本。新的 `/dev/console` 消费者打开时必须先读空丢弃，否则登录时的用户名/
-  密码会被回放到 shell。conhost 在 `input_open_path()` 里做了这一步。
+- 内核不再提供 XAPI 文本/终端兼容层：`xapi_Getch` / `xapi_Input` / `xapi_Printf`
+  和 `SXAH_MARK_IS_TERMINAL` 等终端 syscall 已删除，也不再保存 per-process
+  终端状态（`x3tp_terminal_t` / `x3tp_terminal_view_t` 已移除）。
+- 终端文本 I/O 在用户态 libc 实现：`read(2)` / `write(2)` /
+  `ioctl(TCGETS/TCSETS)` 到 PTY slave，由 conhost 渲染。
+- 内核只保留 X3TP event core、`/dev/console` 和 PTY/termios。
+- 键盘驱动不再维护第二条字节流：PS/2、USB、VKBD 都只进入 X3TP。
+  USB 自动重复的 legacy 轮询路径随 `get_keyboard_input()` 一起删除。
+- `/dev/stdio` 是内核启动任务的非交互 fallback：输出写串口，输入立即返回 EOF
+  （0，不阻塞），`poll` 只报告 `POLLOUT`，不伪造 `POLLIN`。
+- getty / OOBE 使用 fd 0/1/2 + termios，登录后再 exec shell，不再读内核终端视图。
+- 与 `/dev/console` 抢同一 seat0 ring 的旧兼容 drain 已不存在；新代码只应通过
+  `/dev/console`（conhost）或 PTY 访问输入。
 
 ## 已知限制
 
-1. USB 自动重复只在 legacy `kb_synth` 里合成，`/dev/console` 只看到物理按下。
+1. 内核不再合成 USB 自动重复；`/dev/console` 只看到物理按下，重复语义归终端侧。
 2. 多个 xHCI 控制器会违反“一 source 一生产者”，需要按控制器拆 source。
 3. endpoint 的 open/close 没有绑定 fd 生命周期（`device_t` 无 open/close 回调），
    endpoint0 在内核生命周期内保持 active。

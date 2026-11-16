@@ -4,7 +4,6 @@
 #include <errno.h>
 #include <fs/vfs/vfs.h>
 #include <abi/posix.h>
-#include <installer_protocol.h>
 #include <openxj380/syscall.h>
 #include <math.hpp>
 #include <mm/lazyalloc.h>
@@ -129,15 +128,6 @@ static const char *debug_syscall_name(uint64_t nr)
     case SYS_UTIMES: return "utimes";
     case SYS_OPENAT: return "openat";
     case SYS_NEWFSTATAT: return "newfstatat";
-    case SXAH_INSTALLER_ENUM_DISKS: return "sxah_installer_enum_disks";
-    case SXAH_INSTALLER_START: return "sxah_installer_start";
-    case SXAH_INSTALLER_PROGRESS: return "sxah_installer_progress";
-    case SXAH_INSTALLER_PRECHECK: return "sxah_installer_precheck";
-    case SXAH_INSTALLER_START_EX: return "sxah_installer_start_ex";
-    case SXAH_INSTALLER_RESCUE: return "sxah_installer_rescue";
-    case SXAH_INSTALLER_LOG: return "sxah_installer_log";
-    case SXAH_INSTALLER_START_OPTIONS: return "sxah_installer_start_options";
-    case SXAH_INSTALLER_PRECHECK_OPTIONS: return "sxah_installer_precheck_options";
     case SXAH_SET_LOG_CONFIG: return "sxah_set_log_config";
     case SXAH_GET_LOG_CONFIG: return "sxah_get_log_config";
     case SYS_READLINKAT: return "readlinkat";
@@ -639,18 +629,9 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
 
 
     /* XJ380API XAPI Edition */
-    case XAPI_OUTPUT: do_xapi_Output((char *)regs->rdi); break;
-    case XAPI_INPUT:
-        regs->rax = (uint64_t)do_xapi_Input((char *)regs->rdi, (size_t)regs->rsi, regs->rdx);
-        break;
-    case XAPI_GETCH: regs->rax = (uint64_t)do_xapi_Getch(); break;
-    case XAPI_ENDLINE: do_xapi_Endline(); break;
-    case XAPI_PRINTLINE: do_xapi_Printline((char *)regs->rdi); break;
-    case XAPI_PRINTF: do_xapi_Printf((char *)regs->rdi); break;
     case XAPI_OUTPUT_SERIAL: do_xapi_OutputSerial((char *)regs->rdi); break;
     case XAPI_OPEN_FILE: regs->rax = do_xapi_OpenFile(regs->rdi); break;
     case XAPI_CLOSE_FILE: do_xapi_CloseFile(regs->rdi); break;
-    case XAPI_FILE_DIALOG: regs->rax = (uint64_t)-ENOSYS; break;
     case XAPI_SEARCH_FILE: do_xapi_SearchFile(regs->rdi, regs->rsi, (XAPIT_DirNode **)regs->rdx); break;
     case XAPI_SEARCH_FILE_FREEM: do_xapi_SearchFile_freem((XAPIT_DirNode *)regs->rdi, (int32_t)regs->rsi); break;
     case XAPI_MAKEDIR: regs->rax = (uint64_t)vfs_mkdir((char *)regs->rdi); break;
@@ -773,30 +754,13 @@ extern "C" uint64_t c_syscall_handler(struct X64_REGS *regs, uint64_t user_rsp)
         regs->rax = (uint64_t)-1;
         break;
     }
-    case XAPI_NOTIFY_SEND: case XAPI_NOTIFY_SET_PROCOR: regs->rax = (uint64_t)-ENOSYS; break;
-
     /* Private XJ380 extension range; this is not a stable public ABI. */
-    case SXAH_CHECK_TERMINAL_INIT_STATUS: regs->rax = (uint64_t)x3tp_terminal_ready(); break;
     case SXAH_SYSCALL_RETURN:
         // get_current_task()->parent_group->msgprci = false;
         // message_end();
         break;
-    case SXAH_MARK_IS_TERMINAL: x3tp_mark_terminal(); break;
-    case SXAH_READ_OUTPUT_BUFFER: regs->rax = x3tp_terminal_read_output((char *)regs->rdi, (size_t)regs->rsi); break;
-    case SXAH_WRITE_INPUT_BUFFER: regs->rax = x3tp_terminal_write_input((const char *)regs->rdi); break;
-    case SXAH_CHECK_INPUT_BUFFER: regs->rax = x3tp_terminal_waiting_status(); break;
-    case SXAH_UNLOCK_OUTPUT_LOCK: x3tp_terminal_finish_output(); break;
     case SXAH_CHECK_USER_PASSWORD: regs->rax = do_sxah_check_password(regs->rdi, regs->rsi); break;
     case SXAH_MESSAGE_ASK: regs->rax = message_ask(regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8); break;
-    case SXAH_INSTALLER_ENUM_DISKS: regs->rax = do_xapi_InstallerEnumDisks(regs->rdi); break;
-    case SXAH_INSTALLER_START: regs->rax = do_xapi_InstallerStart(regs->rdi); break;
-    case SXAH_INSTALLER_START_EX: regs->rax = do_xapi_InstallerStartEx(regs->rdi, regs->rsi); break;
-    case SXAH_INSTALLER_START_OPTIONS: regs->rax = do_xapi_InstallerStartOptions(regs->rdi); break;
-    case SXAH_INSTALLER_PRECHECK: regs->rax = do_xapi_InstallerPrecheck(regs->rdi, regs->rsi, regs->rdx); break;
-    case SXAH_INSTALLER_PRECHECK_OPTIONS: regs->rax = do_xapi_InstallerPrecheckOptions(regs->rdi, regs->rsi); break;
-    case SXAH_INSTALLER_PROGRESS: regs->rax = do_xapi_InstallerProgress(regs->rdi); break;
-    case SXAH_INSTALLER_RESCUE: regs->rax = do_xapi_InstallerRescue(regs->rdi, regs->rsi, regs->rdx); break;
-    case SXAH_INSTALLER_LOG: regs->rax = do_xapi_InstallerLog(regs->rdi); break;
     case SXAH_SET_LOG_CONFIG:
         if ((regs->rdi & ~LOG_CONFIG_VALID_MASK) != 0)
         {

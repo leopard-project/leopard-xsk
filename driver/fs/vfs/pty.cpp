@@ -146,9 +146,9 @@ static bool pty_pgid_in_session(int pgid, size_t sid)
     return member != NULL && member->sid == sid;
 }
 
-// Called with pair->lock held; the caller has already validated sid/pgid.
-// The slave node's DAC follows the session's identity: owner rw, group write
-// when a group is known, otherwise owner-only. Never world read/write.
+// Called with pair->lock held; the caller already validated sid/pgid.
+// Slave DAC follows the session: owner rw, group write when a group is known,
+// otherwise owner-only. Never world read/write.
 static void pts_ctrl_assign(pty_handle_t *pair, size_t sid, size_t pgid, size_t owner_pid,
                             uint32_t uid, uint32_t gid)
 {
@@ -164,9 +164,8 @@ static void pts_ctrl_assign(pty_handle_t *pair, size_t sid, size_t pgid, size_t 
     }
 }
 
-// Update winsize and notify the foreground pgrp only when it actually changed.
-// The signal is sent after dropping pair->lock (signal_send_group takes the
-// process-list lock and must not run under a spinlock here).
+// Update winsize and notify the foreground pgrp only when it changed.
+// Send the signal after dropping pair->lock (signal_send_group takes pcb locks).
 static errno_t pty_set_winsize(pty_handle_t *pair, const struct winsize *ws)
 {
     if (ws == NULL) return -EFAULT;
@@ -234,9 +233,8 @@ static void ptmx_open(void *parent, const char *name, vfs_node_t node)
         return;
     }
 
-    // The slave is not a controlling terminal yet. Give it the creator's
-    // identity rather than world access; TIOCSCTTY re-stamps it for the
-    // session that actually owns it. Group write only when a group is known.
+    // Not a controlling terminal yet: give the slave the creator's identity.
+    // TIOCSCTTY re-stamps it for the owning session; never world access.
     UserInfo *creator = task_effective_user();
     uint32_t  uid     = user_uid(creator);
     uint32_t  gid     = user_gid(creator);
@@ -294,15 +292,13 @@ static void ptmx_close(void *handle)
     if (pair->master_fds > 0) pair->master_fds--;
     if (pair->master_fds == 0)
     {
-        // The master went away: hang up the slave foreground job exactly once,
-        // then keep the pair alive while a slave still holds it open so slave
-        // reads drain and report EOF instead of touching freed memory.
+        // Master gone: hang up the slave foreground job once, but keep the
+        // pair alive while a slave is open so reads drain and report EOF.
         if (pair->slave_fds > 0 && !pair->hup_sent &&
             (pair->ctrl_pgid > 0 || pair->ctrl_sid > 0))
         {
             pair->hup_sent = true;
-            // Foreground pgrp first; the session leader (pid == sid) is the
-            // fallback when no foreground group was ever set.
+            // Foreground pgrp first, else the session leader (pid == sid).
             hup_pgid = pair->ctrl_pgid > 0 ? pair->ctrl_pgid : pair->ctrl_sid;
         }
         destroy = pair->slave_fds == 0;
@@ -394,8 +390,8 @@ static void pty_flush_input(pty_handle_t *pair)
     pair->canonical_start = 0;
 }
 
-// Called with pair->lock held. No allocation, waiting, or signal delivery here.
-// A false result leaves the byte unconsumed, so a full queue can be retried safely.
+// Called with pair->lock held. No allocation, waiting or signal delivery.
+// A false result leaves the byte unconsumed, so a full queue can be retried.
 static bool pty_input_byte(pty_handle_t *pair, uint8_t ch, int *signal)
 {
     *signal = 0;
@@ -461,8 +457,8 @@ static bool pty_input_byte(pty_handle_t *pair, uint8_t ch, int *signal)
     bool eof = canonical && pty_cc_matches(term, VEOF, ch);
     bool end = canonical && (eof || ch == '\n' || pty_cc_matches(term, VEOL, ch) ||
                              ((flags & IEXTEN) && pty_cc_matches(term, VEOL2, ch)));
-    // Reserve the final slot for a delimiter. Discard excess bytes of an overlong
-    // unfinished line instead of blocking forever before Enter/Erase can arrive.
+    // Reserve the final slot for a delimiter. Discard excess bytes of an
+    // overlong unfinished line instead of blocking before Enter/Erase arrives.
     if (canonical && !end && pair->ptr_slave >= PTY_BUFF_SIZE - 1 && pair->canonical_start == 0) return true;
     if (pair->ptr_slave == PTY_BUFF_SIZE) return false;
     if (!eof && !pty_echo_char(pair, ch)) return false;
@@ -607,8 +603,8 @@ static void pts_open(void *parent, const char *name, vfs_node_t node)
     node->type   = file_pts;
     node->fsid   = pts_fsid;
     node->size   = (uint64_t)-1;
-    // Preserve the slave node's owner/group/mode: opening it must not
-    // re-grant world access to another session.
+    // Preserve the slave node's owner/group/mode: opening it must not widen
+    // access for another session.
     if (pair->slave_node == NULL) pair->slave_node = node;
     spin_unlock(&pair->lock);
     spin_unlock(&pty_global_lock);
@@ -758,8 +754,8 @@ static errno_t pts_ioctl(void *handle, size_t request, void *arg)
     uint32_t req    = (uint32_t)request;
     pcb_t    caller = pty_caller_group();
 
-    // Job-control ioctls scan the process table, so they are validated before
-    // taking pair->lock (never hold a pty spinlock while taking pcb locks).
+    // Job-control ioctls scan the process table, so validate them before
+    // pair->lock (never hold a pty spinlock while taking pcb locks).
     if (req == TIOCSWINSZ) return pty_set_winsize(pair, (const struct winsize *)arg);
 
     if (req == TIOCSCTTY)
@@ -768,8 +764,8 @@ static errno_t pts_ioctl(void *handle, size_t request, void *arg)
         int flags = (int)(uintptr_t)arg;
         if (flags != 0 && flags != 1) return -EINVAL;
         if (caller->sid == 0) return -EPERM;
-        // Linux: acquiring a controlling terminal needs a session leader;
-        // arg == 1 explicitly steals one from another session.
+        // Linux: acquiring a ctty needs a session leader; arg == 1 steals one
+        // from another session.
         if (caller->pid != caller->sid && flags != 1) return -EPERM;
 
         UserInfo *identity = task_effective_user();
@@ -799,8 +795,8 @@ static errno_t pts_ioctl(void *handle, size_t request, void *arg)
         int attached_sid = pair->ctrl_sid;
         spin_unlock(&pair->lock);
 
-        // A terminal only accepts a foreground group from the session that owns
-        // it. If it is not attached yet, the caller's session claims it.
+        // A terminal accepts a foreground group only from its owning session;
+        // if it is not attached yet, the caller's session claims it.
         size_t sid = attached_sid > 0 ? (size_t)attached_sid : caller->sid;
         if (caller->sid != sid) return -EPERM;
         if (!pty_pgid_in_session(pgid, sid)) return -EPERM;
@@ -1006,9 +1002,8 @@ void pty_detach_controlling(size_t sid, size_t owner_pid)
         spin_lock(&pos->lock);
         if (pos->ctrl_sid == (int)sid && pos->ctrl_owner_pid == (int)owner_pid)
         {
-            // The process that attached this controlling terminal is leaving
-            // for a new session; do not keep a stale foreground pgrp pointing
-            // into the old one. Other processes' terminals are untouched.
+            // The attacher is leaving for a new session: drop the stale
+            // foreground pgrp. Other sessions' terminals are untouched.
             pos->ctrl_pgid       = 0;
             pos->ctrl_sid        = 0;
             pos->ctrl_owner_pid = 0;
@@ -1031,7 +1026,7 @@ void pty_set_controlling_owner(size_t sid, uint32_t uid, uint32_t gid)
 
         spin_lock(&pos->lock);
         // Re-check under the pair lock: ctrl_sid can change without the global
-        // lock. Only plain field writes happen here, no sleeping/allocating.
+        // lock. Plain field writes only; no sleeping or allocation.
         if (pos->ctrl_sid == (int)sid && pos->slave_node != NULL)
         {
             pos->slave_node->owner = uid;
@@ -1064,14 +1059,10 @@ int pty_session_foreground_pgid(size_t sid)
     return result;
 }
 
-// VFS /dev/tty resolver: open the slave side of the pty that is the controlling
-// terminal of the caller's session. Returns a referenced node, or NULL when the
-// session has no usable pty (the static devfs /dev/tty then takes over).
-//
-// Simplification for this pass: at most one pty is tracked per session
-// (Linux also allows only one controlling terminal per session). A hung-up or
-// locked pty is not returned, so the caller falls back to the console tty
-// instead of receiving ENXIO.
+// VFS /dev/tty resolver: open the slave of the pty that is the controlling
+// terminal of the caller's session, or NULL when there is none (the static
+// devfs /dev/tty then takes over). One ctty per session, like Linux; a
+// hung-up or locked pty is skipped so the caller falls back to the console.
 static vfs_node_t pty_open_ctty_node(void)
 {
     pcb_t caller = pty_caller_group();
@@ -1097,8 +1088,7 @@ static vfs_node_t pty_open_ctty_node(void)
         node->handle    = pos;
         node->type      = file_pts;
         node->fsid      = pts_fsid;
-        // Keep the slave node's DAC (owner/group/mode) established by
-        // TIOCSCTTY; resolving /dev/tty must not widen access.
+        // Keep the DAC set by TIOCSCTTY: resolving /dev/tty must not widen access.
         node->size      = (uint64_t)-1;
         node->refcount++;
         result = node;

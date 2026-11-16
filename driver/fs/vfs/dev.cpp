@@ -1,6 +1,5 @@
-/**
- * Device Virtual File System
- * 设备虚拟文件系统
+/*
+ * Device virtual file system (/dev).
  */
 #define ALL_IMPLEMENTATION
 #include "fs/vfs/devfs.h"
@@ -59,16 +58,14 @@ static errno_t devfs_register0(const char *path, size_t id) {
     node->rdev     = device->vdiskid;
     vfs_node_t child = vfs_child_append(node, device->drive_name, handle);
     if (child != NULL) {
-        // Keep type = file_none so the first lookup still runs devfs_open()
-        // (that is what fills type/size from the device). Only DAC attributes
-        // are stamped here.
+        // Keep type = file_none so the first lookup still runs devfs_open();
+        // only DAC attributes are stamped here.
         child->owner = 0;
         child->group = 0;
         child->rdev  = device->vdiskid;
         // Raw block devices and the scanout are root-only: exposing the
         // framebuffer to a non-root process would defeat secret capture mode.
-        // Stream devices (tty/console) are world read/write like Unix /dev/tty;
-        // the dedicated /dev/console endpoint is tightened separately below.
+        // Stream devices keep Unix-style 0666; /dev/console is tightened below.
         vfs_node_set_mode(child,
                           device->type == DEVICE_BLOCK ? 0600
                           : device->type == DEVICE_FB ? 0600
@@ -81,7 +78,7 @@ static errno_t devfs_register0(const char *path, size_t id) {
 }
 
 static errno_t devfs_mount(const char *handle, vfs_node_t node) {
-    (void)handle; // vfs_mount_virtual() 已按注册 ID 选中本文件系统
+    (void)handle; // vfs_mount_virtual() already picked this fs by registration ID
     if (root_handle == NULL) {
         root_handle         =  (device_handle_t)calloc(1, sizeof(struct device_handle));
         root_handle->device = NULL;
@@ -194,8 +191,8 @@ size_t devfs_read(void *file, void *addr, size_t offset, size_t size) {
             return VFS_STATUS_FAILED;
         }
         // Stream reads may report a negative errno (e.g. -EAGAIN from
-        // /dev/console when the seat ring is empty); pass it through
-        // untouched and only copy real payload bytes.
+        // /dev/console when the seat ring is empty); pass it through and copy
+        // only real payload bytes.
         ssize_t got = (ssize_t)device.read(device.vdiskid, bounce, size, offset);
         if (got > 0) {
             memcpy(addr, bounce, (size_t)got);
@@ -358,9 +355,7 @@ errno_t devfs_register(const char *path, size_t id) {
     return devfs_register0(device->path, id);
 }
 
-/* ------------------------------------------------------------------------ */
-/* /dev/console — Input Core v2 seat0 endpoint                              */
-/* ------------------------------------------------------------------------ */
+// ---- /dev/console: X3TP seat0 endpoint ----------------------------------
 
 static size_t console_dev_read(int drive, uint8_t *buffer, size_t number, size_t lba) {
     (void)drive;
@@ -373,8 +368,8 @@ static size_t console_dev_write(int drive, uint8_t *buffer, size_t number, size_
     (void)buffer;
     (void)number;
     (void)lba;
-    /* v1 has no console write surface: committed text is produced by the
-       console host through the PTY, never by writing to the input endpoint. */
+    // No write surface in v1: committed text comes from the console host
+    // through the PTY, never by writing to the input endpoint.
     return (size_t)-ENOSYS;
 }
 

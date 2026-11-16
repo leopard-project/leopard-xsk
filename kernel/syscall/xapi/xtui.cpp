@@ -25,8 +25,6 @@
 #include <user/settings.h>
 #include <user/user.h>
 #include <errno.h>
-#include <x3tp.h>
-#include <ps2/keyboard.h>
 
 extern UserInfo *current_user;
 extern lock_queue *pcb_group_queue;
@@ -194,69 +192,7 @@ uint64_t do_xapi_GetTaskList(uint64_t buffer, uint64_t max_count)
 
 void do_xapi_FlushTime()
 {
-    /* 无 RTC 写回支持：no-op */
-}
-
-// Helpers prefixed with p_xapi_ are private to this translation unit.
-void p_xapi_output_kernel(const char *str)
-{
-#if OPENXJ380_INPUT_OUTPUT_DISABLED
-    (void)str;
-    return;
-#else
-    if (str == NULL) return;
-
-    pcb_t front_p = get_current_task()->parent_group;
-    pcb_t caller = front_p;
-    while (true)
-    {
-        if (front_p == NULL || front_p == kernel_group)
-        {
-            write_serial_string(str);
-            return;
-        }
-        if (front_p->terminal->console_owner)
-        {
-            /* The terminal owner (getty console host) renders child output
-             * directly.  Child processes still write into the terminal's
-             * X3TP terminal output buffer. */
-            if (front_p == get_current_task()->parent_group) {
-                write_serial_string(str);
-                return;
-            }
-
-            // found it!
-            if (str == NULL) {
-                return;
-            }
-
-            char  *output    = front_p->terminal->output;
-            size_t  out_cap  = sizeof(front_p->terminal->output);
-            size_t  out_len  = strlen(output);
-            size_t  str_len  = strlen(str);
-            size_t  copy_len = str_len;
-
-            if (out_len < out_cap - 1)
-            {
-                size_t avail = out_cap - out_len - 1;
-                if (copy_len > avail) copy_len = avail;
-                memcpy(output + out_len, str, copy_len);
-                output[out_len + copy_len] = '\0';
-            }
-
-            front_p->terminal->output_lock = false;
-
-            while (true)
-            {
-                if (front_p->terminal->output_lock) break;
-                scheduler_yield();
-            }
-            memset(front_p->terminal->output, 0, sizeof(front_p->terminal->output));
-            return;
-        }
-        front_p = front_p->parent_task;
-    }
-#endif
+    // No RTC write-back support: no-op.
 }
 
 static void p_xapi_free_argv(char **argv)
@@ -304,14 +240,6 @@ static int p_xapi_copy_argv_from_user(char **user_argv, char ***out)
 
     p_xapi_free_argv(argv);
     return -E2BIG;
-}
-
-static size_t p_xapi_strnlen(const char *str, size_t max_len)
-{
-    if (str == NULL) return 0;
-    size_t len = 0;
-    while (len < max_len && str[len] != '\0') len++;
-    return len;
 }
 
 void do_xapi_GetSystemVersion(uint64_t str)
@@ -366,9 +294,8 @@ uint64_t do_sxah_check_password(uint64_t username, uint64_t password)
     tcb_t task = get_current_task();
     if (task == NULL || task->parent_group == NULL) return (uint64_t)-ESRCH;
 
-    /* 只对已提权（effective Root）的进程开放密码校验：
-       doas 由 setuid exec 拿到 Root，再回来核对自己用户的密码。
-       普通进程拿不到这个 oracle。 */
+    // Password check is effective-Root only: doas gains Root via setuid exec and
+    // then verifies its own user's password; ordinary processes get no oracle.
     if (task->parent_group->permission_user.user_type != XUT_Root)
         return (uint64_t)-EPERM;
 
@@ -433,148 +360,6 @@ uint64_t do_xapi_UserCreateFirst(uint64_t username, uint64_t password)
     return (uint64_t)ret;
 }
 
-void do_xapi_Output(char *str)
-{
-#if OPENXJ380_INPUT_OUTPUT_DISABLED
-    (void)str;
-    return;
-#else
-    char *kstr = NULL;
-    if (xapi_copy_string_from_user(&kstr, str, XAPI_USER_STRING_MAX) < 0) return;
-    p_xapi_output_kernel(kstr);
-    free(kstr);
-#endif
-}
-
-int do_xapi_Input(char *str, size_t capacity, uint64_t flags)
-{
-#if OPENXJ380_INPUT_OUTPUT_DISABLED
-    (void)str;
-    (void)capacity;
-    (void)flags;
-    return -ENOSYS;
-#else
-    if (str == NULL) return -EFAULT;
-    if (capacity == 0 || capacity > XAPI_USER_STRING_MAX) return -EINVAL;
-    if ((flags & ~((uint64_t)XAPI_INPUT_NO_ECHO)) != 0) return -EINVAL;
-
-    pcb_t front_p = get_current_task()->parent_group;
-    while (true)
-    {
-        if (front_p == NULL || front_p == kernel_group)
-        {
-            char input[XAPI_USER_STRING_MAX];
-            size_t index = 0;
-            size_t discarded = 0;
-            while (true)
-            {
-                uint8_t value = get_keyboard_input();
-                if (value == 0) { scheduler_yield(); continue; }
-                if (value == '\b')
-                {
-                    if (discarded > 0)
-                    {
-                        discarded--;
-                    }
-                    else if (index > 0)
-                    {
-                        index--;
-                    }
-                    else continue;
-                    if ((flags & XAPI_INPUT_NO_ECHO) == 0) write_serial_string("\b \b");
-                    continue;
-                }
-                if (value == '\n') { write_serial_string("\n"); break; }
-                if (value >= 32 && value < 127)
-                {
-                    if (index < capacity - 1) input[index++] = (char)value;
-                    else if (discarded != (~(size_t)0)) discarded++;
-                    if ((flags & XAPI_INPUT_NO_ECHO) == 0)
-                    {
-                        char echo[2] = {(char)value, '\0'};
-                        write_serial_string(echo);
-                    }
-                }
-            }
-            input[index] = '\0';
-            bool copied = copy_to_user_pagedir(xapi_current_pagedir(), str, input, index + 1);
-            if ((flags & XAPI_INPUT_NO_ECHO) != 0) memset(input, 0, sizeof(input));
-            return copied ? 0 : -EFAULT;
-        }
-        if (front_p->terminal->console_owner)
-        {
-            front_p->terminal->view.input_flags = (uint32_t)flags;
-            front_p->terminal->view.wait_for_input = true;
-            // 等待命令行输入
-            while (true)
-            {
-                if (front_p->terminal->view.input_lock) break;
-                scheduler_yield();
-            }
-            size_t input_len = p_xapi_strnlen(front_p->terminal->view.line, sizeof(front_p->terminal->view.line) - 1);
-            while (input_len > 0 && (front_p->terminal->view.line[input_len - 1] == '\n' ||
-                                     front_p->terminal->view.line[input_len - 1] == '\r'))
-                input_len--;
-            front_p->terminal->view.line[input_len] = '\0';
-            if (input_len >= capacity) input_len = capacity - 1;
-            bool copied = copy_to_user_pagedir(xapi_current_pagedir(), str, front_p->terminal->view.line, input_len);
-            char terminator = '\0';
-            if (copied)
-                copied = copy_to_user_pagedir(xapi_current_pagedir(), str + input_len, &terminator, 1);
-            memset(front_p->terminal->view.line, 0, sizeof(front_p->terminal->view.line));
-            front_p->terminal->view.input_lock = false;
-            front_p->terminal->view.wait_for_input = false;
-            front_p->terminal->view.input_flags = 0;
-            return copied ? 0 : -EFAULT;
-        }
-        front_p = front_p->parent_task;
-    }
-#endif
-}
-
-char do_xapi_Getch()
-{
-#if OPENXJ380_INPUT_OUTPUT_DISABLED
-    return 0;
-#else
-    pcb_t front_p = get_current_task()->parent_group;
-    while (true)
-    {
-        if (front_p == NULL || front_p == kernel_group)
-        {
-            pr_warn("A program call xapi_Getch, but cannot found parent terminal. \n");
-            return 0;
-        }
-        if (front_p->terminal->console_owner)
-        {
-            while (true)
-            {
-                int value = x3tp_terminal_getch(&front_p->terminal->view);
-                if (value >= 0) return (char)value;
-                scheduler_yield();
-            }
-        }
-        front_p = front_p->parent_task;
-    }
-#endif
-}
-
-void do_xapi_Endline()
-{
-    p_xapi_output_kernel("\n");
-}
-
-void do_xapi_Printline(char *str)
-{
-    char *kstr = NULL;
-    if (xapi_copy_string_from_user(&kstr, str, XAPI_USER_STRING_MAX) < 0) return;
-    size_t len = p_xapi_strnlen(kstr, XAPI_USER_STRING_MAX - 2);
-    kstr[len] = '\n';
-    kstr[len + 1] = '\0';
-    p_xapi_output_kernel(kstr);
-    free(kstr);
-}
-
 void do_xapi_OutputSerial(char *str)
 {
 #if OPENXJ380_INPUT_OUTPUT_DISABLED
@@ -586,11 +371,6 @@ void do_xapi_OutputSerial(char *str)
     write_serial_string(kstr);
     free(kstr);
 #endif
-}
-
-void do_xapi_Printf(char *str)
-{
-    do_xapi_Output(str);
 }
 
 void do_xapi_Sleep(uint64_t ms)

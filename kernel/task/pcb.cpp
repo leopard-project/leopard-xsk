@@ -448,7 +448,6 @@ void kill_proc0(pcb_t pcb)
     void *elf_file = pcb->elf_file;
     char **envp = pcb->envp;
     tty_t *tty = pcb->tty;
-    x3tp_terminal_t *terminal = pcb->terminal;
     char name[sizeof(pcb->name)];
     memset(name, 0, sizeof(name));
     strncpy(name, pcb->name, sizeof(name) - 1);
@@ -477,7 +476,6 @@ void kill_proc0(pcb_t pcb)
     if (envp) free_envp(envp);
     if (!vfork && pagedir != NULL && pagedir != get_kernel_pagedir()) free_page_directory(pagedir);
     free_tty(tty);
-    free(terminal);
     free(pcb);
     write_serial_fmt("task: Freeing process %s (PID: %d) vfork: %s\n", name, pid,
                      vfork ? "true" : "false");
@@ -1939,7 +1937,6 @@ static void free_partial_process(pcb_t pcb, bool owns_pagedir)
     free(pcb->cmdline);
     free_envp(pcb->argv);
     free(pcb->exe_path);
-    free(pcb->terminal);
     free(pcb);
 }
 
@@ -2116,21 +2113,18 @@ uint64_t process_fork(struct X64_REGS *reg, bool is_vfork, uint64_t user_stack, 
     new_pcb->ipc_queue    = queue_init();
     new_pcb->tty          = alloc_default_tty();
 
-    new_pcb->terminal = (x3tp_terminal_t *)malloc(sizeof(x3tp_terminal_t));
-    if (new_pcb->terminal != NULL) memset(new_pcb->terminal, 0, sizeof(x3tp_terminal_t));
     if (new_pcb->cmdline == NULL || (current_pcb->argc > 0 && new_pcb->argv == NULL) ||
         (current_pcb->exe_path != NULL && new_pcb->exe_path == NULL) ||
         new_pcb->thread_queue == NULL || new_pcb->child_pcb == NULL ||
         new_pcb->virt_queue == NULL || new_pcb->file_open == NULL || new_pcb->file_open_shared_refs == NULL ||
         new_pcb->ipc_queue == NULL ||
-        new_pcb->tty == NULL || new_pcb->terminal == NULL)
+        new_pcb->tty == NULL)
     {
         free_partial_process(new_pcb, !is_vfork);
         spin_unlock(&create_thread_lock);
         restore_runtime_state(scheduler_depth, is_sti);
         return (uint64_t)-ENOMEM;
     }
-    memset(new_pcb->terminal, 0, sizeof(x3tp_terminal_t));
 
     new_pcb->queue_index = queue_enqueue(pcb_group_queue, new_pcb);
     if (new_pcb->queue_index == (size_t)-1)
@@ -2815,25 +2809,6 @@ pcb_t create_process_group_as(const char *name, pcb_t parent, page_directory_t *
     pcb->mmap_start  = USER_MMAP_START;
     // pcb->msgprci = false;
 
-    pcb->terminal = (x3tp_terminal_t *)malloc(sizeof(x3tp_terminal_t));
-    if (pcb->terminal != NULL) memset(pcb->terminal, 0, sizeof(x3tp_terminal_t));
-    if (pcb->terminal == NULL)
-    {
-        queue_remove_at(pcb->parent_task->child_pcb, pcb->child_index);
-        free(pcb->cmdline);
-        free_envp(pcb->envp);
-        queue_destroy(pcb->thread_queue);
-        queue_destroy(pcb->child_pcb);
-        queue_destroy(pcb->file_open);
-        queue_destroy(pcb->virt_queue);
-        queue_destroy(pcb->ipc_queue);
-        free_tty(pcb->tty);
-        queue_remove_at(pcb_group_queue, pcb->queue_index);
-        free(pcb);
-        return NULL;
-    }
-    memset(pcb->terminal, 0, sizeof(x3tp_terminal_t));
-
     return pcb;
 }
 
@@ -2866,7 +2841,6 @@ void process_setup()
     kernel_pcb->queue_index  = queue_enqueue(pcb_group_queue, kernel_pcb);
     kernel_pcb->thread_queue = queue_init();
     kernel_pcb->child_pcb    = queue_init();
-    kernel_pcb->terminal    = (x3tp_terminal_t *)calloc(1,sizeof(x3tp_terminal_t));
     kernel_pcb->file_open    = queue_init();
     kernel_pcb->file_open_shared_refs = alloc_fd_table_ref();
     kernel_pcb->virt_queue   = queue_init();

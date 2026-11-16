@@ -90,7 +90,6 @@ struct keyboard_buf
 bool wait_ps2_write();
 bool wait_ps2_read();
 
-uint8_t get_keyboard_input();
 void keyboard_init();
 
 enum keyboard_layout_id

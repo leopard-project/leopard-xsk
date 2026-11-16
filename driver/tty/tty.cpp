@@ -10,15 +10,10 @@
 #include <errno.h>
 #include <ioctl.h>
 #include <krlibc.h>
-#include <ps2/keyboard.h>
 #include <rng.h>
 #include <task/pcb.h>
 #include <task/poll.h>
-#include <task/scheduler.h>
 #include <tty.h>
-#include <x3tp.h>
-
-extern void p_xapi_output_kernel(const char *str);
 
 tty_t *defualt_tty = NULL;
 int    tty_mode = KD_TEXT;
@@ -32,38 +27,24 @@ static tty_t *current_tty()
     return task->parent_group->tty;
 }
 
-static x3tp_terminal_t *current_x3tp_terminal()
-{
-    tcb_t task = get_current_task();
-    pcb_t process = task != NULL ? task->parent_group : NULL;
-    while (process != NULL && process != kernel_group)
-    {
-        if (process->terminal != NULL && process->terminal->console_owner) return process->terminal;
-        process = process->parent_task;
-    }
-    return NULL;
-}
-
 static void tty_kernel_flush(tty_t *tty)
 {
     (void)tty;
 }
 
+// /dev/stdio is a non-interactive fallback for kernel-launched tasks: output
+// goes to the serial console, never to a kernel-side terminal view.
 static void tty_kernel_print(tty_t *tty, const char *msg)
 {
     (void)tty;
-    /* p_xapi_output_kernel already routes to the XTTTP terminal when one
-     * exists, and falls back to the serial/framebuffer console otherwise.
-     * Writing serial here as well would duplicate every line on the
-     * LeopardOS serial console (there is no separate terminal app). */
-    p_xapi_output_kernel(msg);
+    write_serial_string(msg);
 }
 
 static void tty_kernel_putc(tty_t *tty, int c)
 {
     (void)tty;
     char buf[2] = {(char)c, '\0'};
-    p_xapi_output_kernel(buf);
+    write_serial_string(buf);
 }
 
 static void tty_termios_default(termios_t *termios)
@@ -116,81 +97,14 @@ tty_t *get_default_tty()
     return defualt_tty;
 }
 
+// No kernel-side line editor exists any more: a kernel-launched task has no
+// interactive terminal, so report EOF immediately instead of blocking.
 static size_t stdin_read(int drive, uint8_t *buffer, size_t number, size_t lba) {
-    bool is_sti = are_interrupts_enabled();
-    open_interrupt;
-
-    x3tp_terminal_t *terminal = current_x3tp_terminal();
-    if (terminal != NULL)
-    {
-        terminal->view.wait_for_input = true;
-        while (!terminal->view.input_lock)
-        {
-            scheduler_yield();
-        }
-    }
-
-    size_t i = 0;
-    for (; i < number; i++) {
-        char c;
-        if (terminal != NULL)
-        {
-            c = terminal->view.line[0];
-            if (c == '\0') break;
-            size_t remaining = strlen(terminal->view.line);
-            if (remaining > 0)
-            {
-                memmove(terminal->view.line, terminal->view.line + 1, remaining);
-            }
-        }
-        else
-        {
-            c = (char)get_keyboard_input();
-        }
-        if (c == '\0') { break; }
-        tty_t *tty = current_tty();
-        uint32_t lflag = tty != NULL ? tty->termios.c_lflag : 0;
-        if (c == 0x9) { c = '\t'; }
-        if (terminal == NULL && (c == 0x7f || c == '\b') && (lflag & ICANON)) {
-            if (tty != NULL && (lflag & ECHO)) write_serial_fmt("\b \b");
-            if (i > 0) {
-                i--;
-                buffer[i] = '\0';
-            }
-            continue;
-        }
-        if (tty != NULL && (lflag & ECHO)) write_serial_fmt("%c", c);
-        buffer[i] = c;
-        if (c == '\n') {
-            i++;
-            break;
-        }
-    }
-
-    if (terminal != NULL)
-    {
-        if (terminal->view.line[0] == '\0')
-        {
-            terminal->view.input_lock = false;
-            terminal->view.wait_for_input = false;
-        }
-        else
-        {
-            terminal->view.input_lock = true;
-            terminal->view.wait_for_input = false;
-        }
-    }
-
-    if (!is_sti) close_interrupt;
-
-    pcb_t process = get_current_task() ? get_current_task()->parent_group : NULL;
-    if (process != NULL && process->linux_abi) {
-        // write_serial_fmt("[] stdin_read requested=%llu ret=%llu\n",
-        //                  (unsigned long long)number,
-        //                  (unsigned long long)i);
-    }
-
-    return i;
+    UNUSED(drive);
+    UNUSED(buffer);
+    UNUSED(number);
+    UNUSED(lba);
+    return 0;
 }
 
 static size_t stdout_write(int drive, uint8_t *buffer, size_t number, size_t lba) {
@@ -289,21 +203,21 @@ static errno_t tty_ioctl(device_t *device, size_t req, void *arg)
     return EOK;
 }
 
+// Input is EOF, so only writability is reported; a fake POLLIN would spin
+// readers on a descriptor that can never produce data.
 static errno_t tty_poll(size_t events)
 {
     int revents = 0;
-    if (events & POLLIN)
-    {
-        x3tp_terminal_t *terminal = current_x3tp_terminal();
-        if (terminal != NULL)
-        {
-            if (terminal->view.line[0] != '\0') revents |= POLLIN;
-        }
-        else
-        {
-            revents |= POLLIN;
-        }
-    }
+    if (events & POLLOUT) revents |= POLLOUT;
+    return revents;
+}
+
+// /dev/null and /dev/urandom always have data (EOF or fresh bytes) and accept
+// writes, unlike the dead interactive input of /dev/stdio.
+static errno_t ready_poll(size_t events)
+{
+    int revents = 0;
+    if (events & POLLIN) revents |= POLLIN;
     if (events & POLLOUT) revents |= POLLOUT;
     return revents;
 }
@@ -370,7 +284,7 @@ void build_tty_device()
     null_dev.read        = null_read;
     null_dev.write       = null_write;
     null_dev.ioctl       = tty_ioctl;
-    null_dev.poll        = tty_poll;
+    null_dev.poll        = ready_poll;
     null_dev.map         = (mapf)empty;
     regist_device(NULL, null_dev);
 
@@ -383,7 +297,7 @@ void build_tty_device()
     urandom_dev.read        = urandom_read;
     urandom_dev.write       = urandom_write;
     urandom_dev.ioctl       = tty_ioctl;
-    urandom_dev.poll        = tty_poll;
+    urandom_dev.poll        = ready_poll;
     urandom_dev.map         = (mapf)empty;
     regist_device(NULL, urandom_dev);
 }

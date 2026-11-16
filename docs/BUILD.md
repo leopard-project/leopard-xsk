@@ -31,6 +31,10 @@ python3 tools/gen_ninja.py
 ninja
 ```
 
+`gen_ninja.py` 同时生成 gitignored 的 `kernel/build_config.h`，其中的
+`CONFIG_KN_VERSION` 从当前 git tag 派生（例如 `v2.2.1` -> `XSK 2.2.1`）。
+OpenXJ380 固定为 `XSK 2.1.0`；不要手改生成文件，升级版本只打 tag 后重新生成。
+
 产物：`out/kernel.krl`（内核 = kernel + 内建驱动 + 字体）。
 
 可选目标：

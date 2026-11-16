@@ -1,10 +1,8 @@
 /*
  * /dev/vkbd — virtual keyboard injection primitive.
- *
- * This is an input-source device, not an IME API: user space writes UTF-8 text
- * and the Input Core v2 routes each scalar as a CHAR event on
- * X3TP_SOURCE_VKBD (seat0 -> endpoint0 -> /dev/console). No kernel symbol is
- * exported for this, and the device is root-only.
+ * User space writes UTF-8 and each scalar becomes a CHAR event on
+ * X3TP_SOURCE_VKBD (seat0 -> endpoint0 -> /dev/console). This is an input
+ * source, not an IME API: root-only, no exported symbol.
  */
 #include <cpu/lock.h>
 #include <device.h>
@@ -16,8 +14,8 @@
 #include <proto.hpp>
 #include <syscall/pxapi.h>
 
-/* Multiple user processes may write the same source; the core ring itself is
-   single-producer, so serialise producers here (syscall context, never IRQ). */
+// Several user processes may write the same source; the core ring is
+// single-producer, so serialise producers here (syscall context, never IRQ).
 static spin_t g_vkbd_lock = SPIN_INIT;
 
 #define VKBD_WRITE_MAX 1024

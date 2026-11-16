@@ -77,7 +77,7 @@ static void kb_repeat_lock_release()
     __sync_lock_release(&kb_repeat_lock);
 }
 
-/* Defined later; used by the repeat service to inject into Input Core. */
+// Defined later; the PS/2 IRQ and USB paths inject X3TP events through it.
 extern "C" void keyboard_dispatch_key_message(uint32_t source, uint64_t msg_type, uint8_t value);
 
 static bool kb_value_repeatable(uint8_t value)
@@ -160,25 +160,6 @@ static void keyboard_prepare_fifo()
     kb_fifo_ready = true;
 }
 
-static void kb_usb_repeat_service()
-{
-    uint64_t now = nanoTime();
-    if (now == 0) return;
-
-    kb_repeat_lock_acquire();
-    for (size_t i = 0; i < KB_USB_REPEAT_SLOTS; ++i)
-    {
-        keyboard_usb_repeat_slot *slot = &kb_usb_repeat[i];
-        if (!slot->active || now < slot->next_repeat_ns) { continue; }
-
-        keyboard_dispatch_key_message(X3TP_SOURCE_USB, MSG_KEYDOWN, slot->value);
-        uint64_t rate = __atomic_load_n(&kb_repeat_rate_hz, __ATOMIC_RELAXED);
-        if (rate == 0) rate = 1;
-        slot->next_repeat_ns = now + 1000000000ULL / rate;
-    }
-    kb_repeat_lock_release();
-}
-
 static uint8_t keyboard_translate_base_make_code(uint8_t make_code, bool shift,
                                                  bool caps)
 {
@@ -257,11 +238,10 @@ static uint32_t keyboard_input_flags(void)
 extern "C" void keyboard_dispatch_key_message(uint32_t source, uint64_t msg_type, uint8_t value)
 {
 #if !OPENXJ380_INPUT_OUTPUT_DISABLED
-    /* Input Core v2: printable/control bytes become CHAR events (the only
-     * thing a terminal needs to commit). Special keys (KEY_* >= 128) have a
-     * stable key code and are delivered as KEYDOWN/KEYUP so a seat consumer
-     * can implement cursor/editing semantics. Key-up for a printable byte is
-     * redundant: CHAR is commit-only. */
+    // X3TP: printable/control bytes become CHAR events (all a terminal must
+    // commit); KEY_* >= 128 keep their stable code and go out as
+    // KEYDOWN/KEYUP for cursor/editing semantics. Key-up of a printable byte
+    // is redundant: CHAR is commit-only.
     if (value == 0) return;
 
     x3tp_event_t event = {};
@@ -304,14 +284,7 @@ static void keyboard_update_modifier_state(uint8_t make_code, bool extended, boo
     }
 }
 
-/*
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
-    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25， 26, 27, 28,
-    29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41,
-    42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,
-    55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-    69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88
-*/
+// Key index reference for the tables below (make code 0..88).
 
 uint8_t keyboard_code[256] = {
     0, KEY_ESC, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
@@ -319,8 +292,8 @@ uint8_t keyboard_code[256] = {
     KEY_CTRL, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
     KEY_SHIFT, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', KEY_SHIFT,
     '*', KEY_ALT, ' ', KEY_CAPS, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7, KEY_F8, KEY_F9, KEY_F10,
-    KEY_NUML, KEY_SCROLL, '7', '8', '9', '-', '4', '5', '6', '+', '1', '2', '3', '0', '.', 0, 0, 0, KEY_F11, KEY_F12}; // +0x80 = 释放状态
-uint8_t keyboard_code1[256] = {                                                                                          // 按下Shift
+    KEY_NUML, KEY_SCROLL, '7', '8', '9', '-', '4', '5', '6', '+', '1', '2', '3', '0', '.', 0, 0, 0, KEY_F11, KEY_F12}; // +0x80 = released
+uint8_t keyboard_code1[256] = {                                                                                          // Shift held
     0, KEY_ESC, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
     KEY_TAB, 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
     KEY_CTRL, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '\"', '~',
@@ -338,8 +311,8 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
     event.route = OPENXJ380_INPUT_ROUTE_XJ380_PS2_IRQ;
     if (!OpenXJ380Socket_KeyboardInterrupt(&event))
     {
-        /* Always drain an unhandled i8042 interrupt.  VMware otherwise leaves
-         * the controller output buffer full and subsequent input stalls. */
+        // Always drain an unhandled i8042 interrupt: VMware otherwise leaves
+        // the controller output buffer full and later input stalls.
         (void)inb(PORT_KB_DATA);
         send_eoi();
     }
@@ -405,19 +378,6 @@ extern "C" void c_keyboard_handler(void *regs_ptr, uint64_t error_code)
     kb_e0_prefix = false;
 
     send_eoi();
-#endif
-}
-
-uint8_t get_keyboard_input()
-{
-#if OPENXJ380_INPUT_OUTPUT_DISABLED
-    return 0;
-#else
-    keyboard_prepare_fifo();
-    kb_usb_repeat_service();
-
-    int value = x3tp_terminal_getch(x3tp_terminal_current_view());
-    return value < 0 ? 0 : (uint8_t)value;
 #endif
 }
 

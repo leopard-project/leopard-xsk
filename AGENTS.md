@@ -80,7 +80,7 @@ Not present (by design): `boot/`, `kmod/`, `third_party/`, `user/` (top-level),
 | Initrd / ramdisk | `kernel/initrd.cpp` | Unpacks the XJPAK10 initrd into tmpfs when `BOOT_FLAG_INITRD`; live/installer policy stays in user space. |
 | VFS core | `driver/fs/vfs/vfs.cpp`, `include/fs/vfs/vfs.h` | Node callbacks and dispatch only; no product/IME fields, resolved-name hooks, or path-alias table. `vfs_check_access` / `vfs_check_child_creation` are the permission primitives; `vfs_access_op_t` keeps 0..8 ABI plus 9 = `EXEC`. File DAC uses `vfs_node_mode()` / `vfs_node_set_mode()`; `vfs_chmod`/`vfs_chown` persist through the fs callback; `vfs_read_raw`/`vfs_write_raw`/`vfs_ioctl_raw` are fs-internal block I/O after mount authorization. |
 | Console / tty | `driver/tty/tty.cpp`, `include/tty.h` | `/dev/stdio`, `/dev/tty`, `/dev/null`, `/dev/urandom`, termios/ioctl translation; moved out of the VFS core. |
-| X3TP | `include/x3tp.h`, `kernel/x3tp.cpp` | Event core (per-source SPSC + `source -> seat -> endpoint` static route + IRQ fast path) plus the terminal view (`xapi_Getch`/`xapi_Input`/`SXAH_*`). `/dev/console` (registered in `driver/fs/vfs/dev.cpp`) is the seat0 endpoint read by conhost. No router thread, no global focus table, no data-path lock. |
+| X3TP | `include/x3tp.h`, `kernel/x3tp.cpp` | Event core only: per-source SPSC + `source -> seat -> endpoint` static route + IRQ fast path. `/dev/console` (registered in `driver/fs/vfs/dev.cpp`) is the seat0 endpoint read by conhost. No router thread, no global focus table, no data-path lock, no terminal view. |
 | FATFS port | `driver/fs/fatfs/` | FatFs + Unicode glue; largely upstream-derived. |
 | Pseudo-filesystems | `driver/fs/vfs/` (`dev.cpp` `procfs.cpp` `tmpfs.cpp` `pipefs.cpp` `pty.cpp` …) | Generic VFS-backed pseudo filesystems. |
 | Network pseudo-FS | `driver/net/` (`nmfs.cpp` `dnsfs.cpp`) | `/run/NetworkManager/*` and `/run/dns/*`; regular files, `open/read/write/stat` only, no private ioctl/syscall control channel. |
@@ -285,12 +285,13 @@ lpsh: xapi_Getch/XAPI_INPUT -> COMPOSE -> SXAH_WRITE_INPUT_BUFFER
 8. **不要记录按键内容。**
    IME/daemon 能看到所有按键，日志必须脱敏；engine 身份要校验。
 
-当前决策（2026-11-15）：
+当前决策（2026-11-16）：
 
 ```text
-X3TP（IRQ 路由 + per-source SPSC + seat/endpoint + terminal view）
+X3TP（IRQ 路由 + per-source SPSC + seat/endpoint）
   -> /dev/console + conhost
-  -> PTY/fd stdio
+  -> PTY/fd stdio + termios
+  -> 用户态 libc（xapi_Getch/xapi_Input/xapi_Printf）
   -> leopard-ime manager/engine（终端 IME）
   -> graphics.sys 后再做 GUI IME/候选窗口
 ```
@@ -299,12 +300,13 @@ X3TP（IRQ 路由 + per-source SPSC + seat/endpoint + terminal view）
 
 ---
 
-## X3TP（内核输入/终端标准，2026-11-16）
+## X3TP（内核输入事件标准，2026-11-16）
 
-> X3TP 取代旧的 input router / XTTTP getch 方案，不保留版本号。它包含
-> **event core**（source/seat/endpoint、/dev/console）和 **terminal view**
-> （xapi_Getch/xapi_Input/SXAH 的字节/行/输出视图）。没有 router 线程、没有
-> 全局焦点表，数据路径没有 mutex/spinlock，输入导出仍全部撤掉。
+> X3TP 取代旧的 input router / XTTTP getch 方案，不保留版本号。它只包含
+> **event core**（source/seat/endpoint、/dev/console）。XAPI 文本/终端兼容层
+> （xapi_Getch/xapi_Input/SXAH 的字节/行/输出视图）已删除，改由用户态 libc 经
+> PTY/termios 实现。没有 router 线程、没有全局焦点表，数据路径没有
+> mutex/spinlock，输入导出仍全部撤掉。
 
 ### 数据流
 
@@ -349,18 +351,19 @@ VKBD write ─┘        └─ 静态路由表 source -> seat -> endpoint
 - 删除：`input_router_init()` 与 router 线程、`g_router_lock`、`g_focus_id` 与焦点表、
   `input_route_dispatch*`、`input_route_set_interceptor`、
   `input_sink_push_focused`、`input_sink_focus`、旧 `INPUT_SOURCE_IME`。
-- 删除独立 `input_sink` / `xtttp_dtt`：字节环、行缓冲、输出缓冲合并为
-  `x3tp_terminal_t` + `x3tp_terminal_view_t`，由 X3TP 拥有。没有 sink 注册表、
-  没有全局 focus、没有 `message_getch_try`。
-- `SXAH_MARK_IS_TERMINAL` 只设置 legacy `is_shell`，不再注册/切换任何输入焦点。
-- 保留：per-terminal `x3tp_terminal_t`、`SXAH_*`、`xapi_Getch` / `xapi_Input` /
-  `/dev/stdio` 的行输入。它们都通过 X3TP 实现：
-  `get_keyboard_input()` 读当前终端（或默认）`x3tp_terminal_view_t`，
-  `x3tp_terminal_getch()` 在字节环为空时从 seat0 的 `CHAR` 事件 drain。
-- 键盘驱动不再维护 `kb_fifo` / `kb_synth` 第二条字节流；PS/2、USB、VKBD 都只
-  进入 X3TP。USB auto-repeat 通过 `keyboard_dispatch_key_message()` 重新
-  注入 X3TP。
-- 与 `/dev/console` 同时读仍会竞争同一 seat0 ring，是过渡期兼容行为。
+- 删除独立 `input_sink` / `xtttp_dtt`：没有 sink 注册表、没有全局 focus、
+  没有 `message_getch_try`。
+- 删除内核 terminal view：`x3tp_terminal_t`、`x3tp_terminal_view_t`、
+  `g_default_terminal`、PCB 的 `terminal` 字段，以及 `xapi_Getch` /
+  `xapi_Input` / `xapi_Printf` / `SXAH_*` 终端 syscall。终端文本 I/O 由用户态
+  libc 经 `read`/`write`/`ioctl(TCGETS/TCSETS)` 走 PTY slave。
+- `/dev/stdio` 保留为非交互 fallback：输出写串口，输入立即 EOF（0，不阻塞），
+  `poll` 只报告 `POLLOUT`。
+- `get_keyboard_input()` 已删除；键盘驱动不再维护 `kb_fifo` / `kb_synth` 第二条
+  字节流，PS/2、USB、VKBD 都只进入 X3TP。内核不再合成 USB 自动重复。
+- 已退休的 syscall 号不复用：`XAPI_OUTPUT` 7381、`XAPI_INPUT` 7382、
+  `XAPI_GETCH` 7383、`XAPI_ENDLINE` 7384、`XAPI_PRINTLINE` 7385、
+  `XAPI_PRINTF` 7386、`XAPI_GETLINE` 7418，以及 `SXAH_*` 终端/installer 兼容号。
 - 消息常量：`MSG_CHAR`/`MSG_KEYDOWN`/`MSG_KEYUP`/`MSG_SPCHAR`/`MSG_KEYLONGPRESS`（`include/syscall/pxapi.h`）。
 
 ### 用户态 socket 约束（上游 unix_poll）
@@ -412,9 +415,9 @@ VKBD write ─┘        └─ 静态路由表 source -> seat -> endpoint
 - **device/pci**：`regist_device` / `delete_device`、`pci_find_class` /
   `pci_find_class_n`、`partition_device_added`。
 - **input driver ABI**：仅保留驱动注入所需的 `keyboard_usb_key_event` /
-  `mouse_inject_report`（xhci 使用）。`x3tp_route_*`、`x3tp_terminal_*`、
-  `keyboard_push_input`、`OpenXJ380Socket_*` 均已从导出表移除；输入路由与 legacy
-  终端输入是内核内部原语，模块 ABI 待 X3TP/PTY 与 network-kmod 一起定稿。
+  `mouse_inject_report`（xhci 使用）。`x3tp_route_*`、`x3tp_console_*`、
+  `keyboard_push_input`、`OpenXJ380Socket_*` 均已从导出表移除；输入路由是内核
+  内部原语，模块 ABI 待 X3TP/PTY 与 network-kmod 一起定稿。
 - **user/session**：`current_user`（`_OBJECT`）、`user_session_is_ready`
   （IME 相邻 ABI，待外部确认前保留）。
 - **xapi_json**：`xapi_parseJson` / `xapi_freeJsonValue` / `xapi_freeJsonDocument` /
@@ -440,7 +443,7 @@ VKBD write ─┘        └─ 静态路由表 source -> seat -> endpoint
   内核启动日志、`[busybox-debug]`、leopard-rc/mountd 等系统服务日志都留在串口。
 - framebuffer 只属于用户态 terminal host（conhost / compositor）；内核不再把日志
   画到 fb，避免污染 VT。
-- installer/getty/shell 的业务输出走各自的 terminal view / PTY，由 conhost 渲染。
+- installer/getty/shell 的业务输出走各自的 PTY，由 conhost 渲染。
 
 ### LeopardOS console host / getty
 - 启动链：`rc → conhost → getty → shell`。conhost 以 root 拥有 `/dev/console`
@@ -456,8 +459,8 @@ VKBD write ─┘        └─ 静态路由表 source -> seat -> endpoint
   `TCGETS/TCSETS` 的 `ECHO` 开关处理密码，不再使用 `XAPI_INPUT`。
 - conhost 从 `/dev/console` 读 `x3tp_event_t`，写 PTY；IME manager 以 pipe
   连接。
-- `SXAH_*` / `xapi_Getch` / `xapi_Input` 只保留为 X3TP terminal view 的
-  兼容 API，供旧 XAPI 应用使用。
+- 终端文本 I/O（`xapi_Getch` / `xapi_Input` / `xapi_Printf`）在用户态 libc
+  实现，经 PTY/termios 落到 fd 0/1；内核不再提供这些 syscall。
 - serial 只做内核/启动日志，不提供裸 TTY 登录路径。
 
 ### kmod 加载

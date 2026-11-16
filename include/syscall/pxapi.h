@@ -25,11 +25,6 @@ typedef struct {
 #define SXAH_SYSCALL_RETURN         128956723895689201      // syscall返回
 #define SXAH_CREATE_KERNEL_TERMINAL 128956723895689202      // 创建内核态进程
 #define SXAH_CHECK_USER_PASSWORD    128956723895689203      // 检查用户密码
-#define SXAH_MARK_IS_TERMINAL       128956723895689204      // 标记为命令行
-#define SXAH_WRITE_INPUT_BUFFER     128956723895689205      // 写入XTTTP输入缓冲区
-#define SXAH_READ_OUTPUT_BUFFER     128956723895689206      // 读取XTTTP输出缓冲区
-#define SXAH_CHECK_INPUT_BUFFER     128956723895689207      // 检查是否需要输入
-#define SXAH_UNLOCK_OUTPUT_LOCK     128956723895689208      // 完成输出，关闭输出锁
 #define SXAH_MESSAGE_ASK            128956723895689209      // message查询
 #define SXAH_SET_MOUSE_WHEEL_REVERSE 128956723895689210     // 设置全局鼠标滚轮方向
 #define SXAH_SET_LOG_CONFIG          128956723895689211     // 设置日志与日志框配置
@@ -47,18 +42,6 @@ typedef struct {
                                       LOG_CONFIG_CAT_DEBUG | LOG_CONFIG_CAT_KERNEL)
 #define LOG_CONFIG_VALID_MASK        (LOG_CONFIG_OVERLAY_ENABLED | LOG_CONFIG_RECORD_LOGS | LOG_CONFIG_CATEGORY_MASK)
 #define LOG_CONFIG_DEFAULT           LOG_CONFIG_VALID_MASK
-
-#define SXAH_INSTALLER_ENUM_DISKS       128956723895689220
-#define SXAH_INSTALLER_START            128956723895689221
-#define SXAH_INSTALLER_PROGRESS         128956723895689222
-#define SXAH_INSTALLER_PRECHECK         128956723895689223
-#define SXAH_INSTALLER_START_EX         128956723895689224
-#define SXAH_INSTALLER_RESCUE           128956723895689225
-#define SXAH_INSTALLER_LOG              128956723895689226
-#define SXAH_INSTALLER_START_OPTIONS    128956723895689227
-#define SXAH_INSTALLER_PRECHECK_OPTIONS 128956723895689228
-
-#define SXAH_CHECK_TERMINAL_INIT_STATUS  3801    // 查询终端初始化状态
 
 typedef struct
 {
@@ -80,17 +63,7 @@ typedef struct {
     UserType user_type;
 } xapi_type_LoginUserInfo;
 
-// P3.1
-#define XAPI_OUTPUT    7381
-#define XAPI_INPUT     7382
-#define XAPI_INPUT_NO_ECHO 0x1
-
-#define XAPI_GETLINE   7418
-
-#define XAPI_GETCH          7383
-#define XAPI_ENDLINE        7384
-#define XAPI_PRINTLINE      7385
-#define XAPI_PRINTF         7386
+// P3.1: serial output only; text I/O lives in the userspace libc.
 #define XAPI_OUTPUT_SERIAL  7427
 
 // P3.2
@@ -108,7 +81,6 @@ typedef struct {
 #define XAPI_WRITE_FILE     7424
 
 #define XAPI_REMOVEDIR      7444
-#define XAPI_FILE_DIALOG    7450
 
 // P3.4
 #define XAPI_FORK   7389
@@ -143,37 +115,8 @@ typedef struct {
 #define XAPI_FLUSH_TIME     7445
 #define XAPI_POWER_ACTION   7464
 
-// P3.6.2
-#define XAPI_NOTIFY_SEND        7465
-#define XAPI_NOTIFY_SET_PROCOR  7466
-
 #define XPOWER_REBOOT   1
 #define XPOWER_SHUTDOWN 2
-
-typedef enum
-{
-    XNOTIFY_ICON_NONE = 0,
-    XNOTIFY_ICON_INFO = 1,
-    XNOTIFY_ICON_SUCCESS = 2,
-    XNOTIFY_ICON_WARNING = 3,
-    XNOTIFY_ICON_ERROR = 4,
-    XNOTIFY_ICON_APP = 5,
-} XNotifyBuiltinIcon;
-
-typedef struct
-{
-    uint64_t key;
-    char    *title;
-    char    *text;
-    uint64_t builtin_icon;
-    char    *icon_path;
-    char    *action0_text;
-    uint64_t action0_id;
-    char    *action1_text;
-    uint64_t action1_id;
-} XApiNotificationRequest;
-
-typedef void (*XApiNotifyPrcor)(uint64_t notification_id, uint64_t action_id);
 
 // P3.7
 #define XAPI_MALLOC         7441
@@ -274,7 +217,7 @@ typedef void (*XApiNotifyPrcor)(uint64_t notification_id, uint64_t action_id);
 #define XWIN_TYPE_MASK          0x0f
 #define XWIN_SUPPORT_RESIZEABLE 0x80
 
-// 当前最大号：7486
+// 当前最大号：7502
 
 #define XAPI_CAPTURE_SCREEN 7473
 
@@ -308,11 +251,6 @@ typedef struct
 } XapiSystemStats;
 
 // Proto (XAPI Edition)
-void do_xapi_Output(char *str);
-int  do_xapi_Input(char *str, size_t capacity, uint64_t flags);
-char do_xapi_Getch();
-void do_xapi_Endline();
-void do_xapi_Printline(char *str);
 void do_xapi_OutputSerial(char *str);
 void do_xapi_SearchFile(uint64_t path, uint64_t count, XAPIT_DirNode **dir);
 void do_xapi_SearchFile_freem(XAPIT_DirNode *dir, int32_t count);
@@ -321,7 +259,6 @@ uint64_t do_xapi_GetTime();
 void do_xapi_GetCurrentUser(uint64_t dst);
 uint64_t do_xapi_ReadFile(struct X64_REGS *regs);
 uint64_t do_xapi_WriteFile(struct X64_REGS *regs);
-void do_xapi_Printf(char *str);
 void do_xapi_Sleep(uint64_t ms);
 uint64_t do_xapi_OpenFile(uint64_t path);
 void do_xapi_CloseFile(uint64_t ptr);
@@ -342,19 +279,6 @@ uint64_t do_sxah_check_password(uint64_t username, uint64_t password);
 uint64_t do_xapi_UserCreateFirst(uint64_t username, uint64_t password);
 uint64_t do_xapi_PowerAction(uint64_t action);
 uint64_t do_xapi_SendAppMessage(char *title, char *text);
-uint64_t do_xapi_SendNotification(const XApiNotificationRequest *req);
-uint64_t do_xapi_SetNotifyPrcor(uint64_t func);
-uint64_t do_xapi_InstallerEnumDisks(uint64_t list);
-uint64_t do_xapi_InstallerStart(uint64_t disk_id);
-uint64_t do_xapi_InstallerStartEx(uint64_t disk_id, uint64_t mode);
-uint64_t do_xapi_InstallerStartOptions(uint64_t options);
-uint64_t do_xapi_InstallerPrecheck(uint64_t disk_id, uint64_t mode, uint64_t out);
-uint64_t do_xapi_InstallerPrecheckOptions(uint64_t options, uint64_t out);
-uint64_t do_xapi_InstallerProgress(uint64_t progress);
-uint64_t do_xapi_InstallerRescue(uint64_t action, uint64_t disk_id, uint64_t out);
-uint64_t do_xapi_InstallerLog(uint64_t out);
-
-
 
 // Process-lifetime global screen capture protection.
 #define XAPI_SET_SECRET           7486
@@ -371,8 +295,9 @@ uint64_t do_xapi_InstallerLog(uint64_t out);
 void init_syscall();
 
 // Proto (XAPI Edition)
-// 输入路由已迁移到 include/x3tp.h 的 Input Core v2
-// （source -> seat -> endpoint，IRQ 直接入队，无 router 线程/全局焦点）。
+// 输入事件走 include/x3tp.h 的 X3TP event core
+// （source -> seat -> endpoint，IRQ 直接入队，无 router 线程/全局焦点）；
+// 终端文本 I/O 在用户态 libc 经 PTY/termios 实现，内核不再提供。
 // 本头文件只保留消息常量与 GUI/XAPI 声明。
 // GUI 窗口消息投递：WinMpf 回调经 message pipe 送给指定 ftask（闭源 worker 依赖此签名）。
 void do_message(uint64_t msg_type, uint64_t hData, uint64_t lData, MsgPrcor WinMpf, tcb_t ftask);
