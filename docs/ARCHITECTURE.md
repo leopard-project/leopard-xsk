@@ -1,4 +1,4 @@
-# OpenXSKernel 架构与目录边界
+# leopard-xsk 架构与目录边界
 
 本文说明纯内核仓库的稳定分层、依赖方向和代码归属。它不描述内部 ABI 的全部细节；涉及启动
 顺序、中断帧、页表或系统调用 ABI 的改动，仍应结合相应目录中的 `AGENTS.md` 审查。
@@ -7,7 +7,7 @@
 
 ```text
 UEFI firmware
-    -> OpenXSBoot (BOOTX64.efi，兄弟仓库)
+    -> leopard-boot (BOOTX64.efi，兄弟仓库)
     -> kernel/KernelMain (out/kernel.krl)
     -> kernel core + built-in driver/
     -> VFS/root filesystem
@@ -15,7 +15,7 @@ UEFI firmware
     -> user-space ELF applications（用户态，本仓库之外）
 ```
 
-引导器在 OpenXSBoot 仓库；本仓库只负责固件交接后的一切：CPU/内存/设备/VFS/驱动/SMP/系统
+引导器在 leopard-boot 仓库；本仓库只负责固件交接后的一切：CPU/内存/设备/VFS/驱动/SMP/系统
 调用/进程，以及最后按 cmdline 的 `init=` 启动 PID1。initrd 环境下（`BOOT_FLAG_INITRD`），
 `kernel/initrd.cpp` 把 XJPAK10 initrd 解包进 tmpfs 当根文件系统；live/installer 的判定归用户态。
 
@@ -44,7 +44,7 @@ UEFI firmware
 
 ## 高风险契约
 
-- 页表 / HHDM 高半区布局必须与 OpenXSBoot 交接一致。
+- 页表 / HHDM 高半区布局必须与 leopard-boot 交接一致。
 - `kernel/intr/` 的保存寄存器布局是汇编、调度器和系统调用共同使用的 ABI。
 - `include/syscall/syscall.h` 的 syscall 号与数据结构必须和 `sys.cpp` 实现、
   `syscall.cpp` 分发三处同步。

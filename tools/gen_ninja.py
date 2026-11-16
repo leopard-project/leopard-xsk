@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenXSKernel 独立构建：生成只产出内核 out/kernel.krl 的 build.ninja。"""
+"""leopard-xsk 独立构建：生成只产出内核 out/kernel.krl 的 build.ninja。"""
 import os
 import subprocess
 from pathlib import Path
@@ -85,7 +85,7 @@ def main():
     if builtin_xhci:
         cpp_flags += " -DXHCI_BUILTIN"
 
-    L = ["# OpenXSKernel 专用：只构建内核", "ninja_required_version = 1.10"]
+    L = ["# leopard-xsk 专用：只构建内核", "ninja_required_version = 1.10"]
     L += [f"cc = {cc}", f"cxx = {cxx}", f"nasm = {nasm}", f"ld = {ld}", f"objc = {objc}"]
     L += [f"asm_flags = {asm_flags}", f"c_flags = {c_flags}", f"cpp_flags = {cpp_flags}",
           "nasm_flags = -f elf64 -DX86_64_TARGET -DUEFI", ""]
@@ -190,10 +190,10 @@ def main():
         if conf.get("package", "1") != "0":
             ver = conf.get("version", "1.0_1")
             pkgname = f"{name}-kmod"
-            desc = conf.get("description", f"OpenXSKernel module {name}")
+            desc = conf.get("description", f"leopard-xsk module {name}")
             pkg_out = Path("out") / f"{pkgname}-{ver}.x86_64.xbps"
             stage = f".pkg-kmod-{name}"
-            args = f"-A x86_64 -n {pkgname}-{ver} -s '{desc}' -D 'OpenXSKernel>=2.2.0_2'"
+            args = f"-A x86_64 -n {pkgname}-{ver} -s '{desc}' -D 'leopard-xsk>=2.2.0_2'"
             cmd = (f"rm -rf {stage} && mkdir -p {stage}/mod && cp {esc(target)} {stage}/mod/{name}-kmod.sys && "
                    f"cd out && xbps-create --compression gzip {args} ../{stage}")
             L += [f"rule package_kmod_{name}", f"  command = {cmd}", ""]
@@ -205,10 +205,10 @@ def main():
     L += ["build pack-kmods: phony " + " ".join(esc(x) for x in all_mod_pkgs), ""]
 
     # ---- xbps 打包（pack）----
-    pkg = {"name": "OpenXSKernel", "ver": "2.2.1_1", "arch": "x86_64",
+    pkg = {"name": "leopard-xsk", "ver": "2.2.1_1", "arch": "x86_64",
            "desc": "Leopard kernel", "install": "system/kernel.krl"}
     pkg_args = (f"-A {pkg['arch']} -n {pkg['name']}-{pkg['ver']} -s '{pkg['desc']}' "
-                f"-D 'OpenXSBoot>=2.1.1_2'")
+                f"-D 'leopard-boot>=2.1.1_2'")
     xbps_out = f"out/{pkg['name']}-{pkg['ver']}.{pkg['arch']}.xbps"
     L += [
         "rule package",

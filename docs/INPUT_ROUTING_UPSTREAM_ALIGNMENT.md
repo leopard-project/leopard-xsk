@@ -3,7 +3,7 @@
 > 依据：OpenXJ380 仓库（HEAD a1fcc2f）实际代码逐文件核对。
 > 目的：把之前「从零重构」的方向纠正为「参考/移植 OpenXJ380 已有内核态实现」。
 >
-> **2026-11-15 状态：本文仅保留为上游事实记录，不是 OpenXSKernel 的实施方向。**
+> **2026-11-15 状态：本文仅保留为上游事实记录，不是 leopard-xsk 的实施方向。**
 > XSK 已选择 Input Core v2（`source -> seat -> endpoint`，中断直接路由，
 > `/dev/console` 给用户态 conhost），不移植上游内核 IME（`input_method.cpp` /
 > `ime_config.cpp` / `ime_user_store.cpp`）。当前实现见 `INPUT_ROUTING.md`。
@@ -28,7 +28,7 @@ OpenXJ380 的输入法与输入路由**已经是完整的内核态子系统**，
 | `kernel/syscall/message.cpp` | — | `do_message` → `ime_filter_message` → `do_message_unfiltered` |
 | `kernel/user/x3tp.cpp` | — | 终端 xtttp 原语（input/output 整行缓冲） |
 
-OpenXSKernel 目前**以上文件一个都没有**（已核实 `ls` 全部不存在）。
+leopard-xsk 目前**以上文件一个都没有**（已核实 `ls` 全部不存在）。
 
 ## 二、三个开放问题的官方答案（来自实际代码）
 
@@ -75,7 +75,7 @@ graphics owns and validates window lifetimes」）。我之前「内核只认 si
 
 ## 三、我 Phase 1-3 + SPSC 与上游的逐项偏差
 
-| 维度 | OpenXJ380 上游 | 我在 OpenXSKernel 做的 | 偏差 |
+| 维度 | OpenXJ380 上游 | 我在 leopard-xsk 做的 | 偏差 |
 |---|---|---|---|
 | 拦截 | `ime_filter_message` 固定函数 | `input_route_set_interceptor` 函数指针注册 | 形态不符 |
 | 焦点 | `ImeFocus{pid,tid,window,control,callback,flags,x,y}` | `input_sink` 只存 id | 数据不符 |
@@ -94,7 +94,7 @@ graphics owns and validates window lifetimes」）。我之前「内核只认 si
 ## 五、建议方向（待你拍板）
 
 **A. 移植上游**（推荐）：把 OpenXJ380 的 `input_method.*`、`xime.h`、`ime_config.*`、
-`ime_user_store.*`、`ime_internal.h` 整套移植进 OpenXSKernel，按 OpenXSKernel 的
+`ime_user_store.*`、`ime_internal.h` 整套移植进 leopard-xsk，按 leopard-xsk 的
 构建/风格适配；把我 Phase 1-3 + SPSC 的 4 个 commit 按需 revert 或降级为终端原语。
 
 **B. 仅对齐不移植**：保留我 input_sink 作为底层原语，但把拦截器改回 `ime_filter_message`
@@ -102,4 +102,4 @@ graphics owns and validates window lifetimes」）。我之前「内核只认 si
 
 **C. 先暂停，等你再跟官方确认一次**（比如「管理器/引擎到底是不是用户态进程」这句）。
 
-在拿到你方向前，我不再往 OpenXSKernel 提交新代码。
+在拿到你方向前，我不再往 leopard-xsk 提交新代码。

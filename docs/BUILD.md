@@ -1,7 +1,7 @@
-# OpenXSKernel 构建指南
+# leopard-xsk 构建指南
 
 本文说明从零编译纯内核 `out/kernel.krl` 的完整流程。本仓库**只构建内核**，不含引导器、
-用户态或磁盘镜像——那些在 OpenXSBoot / LeopardOS 仓库。
+用户态或磁盘镜像——那些在 leopard-boot / LeopardOS 仓库。
 
 ## 1. 环境要求
 
@@ -50,7 +50,7 @@ ninja clean   # 清理 out/、kernel/build_config.h、.pkg/
 ## 4. 运行验证
 
 本仓库不直接跑 QEMU；完整的 live ISO 组装与启动验证流程见 **LeopardOS 仓库**
-（`make_iso.sh` + QEMU）。内核被 OpenXSBoot 加载，PID1 由 `boot.conf` 的 `init=`
+（`make_iso.sh` + QEMU）。内核被 leopard-boot 加载，PID1 由 `boot.conf` 的 `init=`
 指定，内核解析 `BOOT_CONFIG.cmdline` 的 `init=` 后启动。
 
 ## 5. 常见问题

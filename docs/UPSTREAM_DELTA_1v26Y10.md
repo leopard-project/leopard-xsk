@@ -13,7 +13,7 @@
 
 | 提交 | 主题 | 归属 | 处理 |
 |---|---|---|---|
-| `42c99c2` | PTY 回显 + 前台信号修复 | 内核原语 | ✅ 已等价移植（OpenXSKernel `44282fa`，逐文件比对一致） |
+| `42c99c2` | PTY 回显 + 前台信号修复 | 内核原语 | ✅ 已等价移植（leopard-xsk `44282fa`，逐文件比对一致） |
 | `62ca2e4` | IME v1 内核子系统 + 访问保护 + 可恢复互斥 | 业务 + 原语 | 业务不进内核；原语已用通用钩子等价实现 |
 | `68064d7` | IME v2 会话 + 用户词库存储 | 业务（+1 处安全修复） | 业务归 `ime-kmod`；用户名路径校验单独移植 |
 | `b33c79e` | 保留 `XAPI_SET_SECRET` (7486) | 内核 ABI | ✅ 随 `a1c44d1` 一并移植 |
@@ -23,7 +23,7 @@
 
 ## 二、逐项分类
 
-### 内核原语（应进 OpenXSKernel）
+### 内核原语（应进 leopard-xsk）
 
 1. **PTY 回显/前台信号**（`42c99c2`）
    `pty.cpp`、`pty.h`、`tty.h`、`signal.h`、`signal.cpp`、`handler.S`、`pcb.cpp` 与上游逐字节一致；
@@ -105,7 +105,7 @@
 这是本批最重要的内核原语，也是 XACT v5 运行时 `xj380_auto_file_access()` 所依赖的
 `XAPI_QUERY_FILE_ACCESS(7500)` 的实现来源。
 
-**内核机制（应进 OpenXSKernel）**
+**内核机制（应进 leopard-xsk）**
 
 - `pcb` 增加 `permission_user`（进程自有身份，不再别名登录账户）、`permission_revision`
 - `include/user/permission_types.h`：`UserPermisson` + 7 位掩码 `XPERM_*`（`8ee255a` 增 `VisitAnotherDir`）
@@ -190,7 +190,7 @@ Leopard 目前全部静态 ELF，暂不需要；若将来要用 XACT 的动态 S
 4. **P3（安全）**：`1147765` 账户认证，和 oobe/getty 一起改。
 5. **暂缓**：ext4/installer、音频、xnet、EPF/rtld、IME 业务、CI/镜像工具。
 
-## 7. 与当前 OpenXSKernel 的已知冲突面
+## 7. 与当前 leopard-xsk 的已知冲突面
 
 | 文件 | 上游改动 | 本地现状 | 处理 |
 |---|---|---|---|

@@ -1,7 +1,7 @@
 # 树内内核模块（kmod）
 
-`OpenXSKernel` 允许把可选功能做成本仓库内的可加载模块，构建成 `.sys`，但**单独打包**，
-不进入 `OpenXSKernel` 内核包。
+`leopard-xsk` 允许把可选功能做成本仓库内的可加载模块，构建成 `.sys`，但**单独打包**，
+不进入 `leopard-xsk` 内核包。
 
 ## 目录布局
 
@@ -16,7 +16,7 @@ kmod/<name>/
 ```ini
 name=example
 version=2.1.0_1
-description=OpenXSKernel example module
+description=leopard-xsk example module
 package=1
 includes=include,third_party/example/include
 cflags=-std=gnu11
@@ -41,7 +41,7 @@ ninja pack-kmod-<name>     # 单个模块包
 ninja pack                 # 仅内核包
 ```
 
-模块包依赖 `OpenXSKernel>=2.2.0_2`，但不会自动进入默认镜像；需要时在镜像 manifest
+模块包依赖 `leopard-xsk>=2.2.0_2`，但不会自动进入默认镜像；需要时在镜像 manifest
 里单独加入包名。
 
 ## 模块 ABI 约定

@@ -8,8 +8,8 @@
       "args": [],
       "stopAtEntry": false,
       "externalConsole": true,
-      "cwd": "c:/$Windows.~OS/G/桌面/XJ380/OpenXSKernel",
-      "program": "c:/$Windows.~OS/G/桌面/XJ380/OpenXSKernel/build/Debug/outDebug",
+      "cwd": "c:/$Windows.~OS/G/桌面/XJ380/leopard-xsk",
+      "program": "c:/$Windows.~OS/G/桌面/XJ380/leopard-xsk/build/Debug/outDebug",
       "MIMode": "gdb",
       "miDebuggerPath": "gdb",
       "setupCommands": [

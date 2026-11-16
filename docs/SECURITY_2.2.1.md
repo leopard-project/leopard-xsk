@@ -1,4 +1,4 @@
-# OpenXSKernel 2.2.1 — security patch
+# leopard-xsk 2.2.1 — security patch
 
 This release hardens the interfaces introduced by the X3TP/PTY console work and
 the doas helper. It is a focused security update: no new syscall numbers and no

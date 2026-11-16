@@ -1,8 +1,13 @@
-# OpenXSKernel
+# leopard-xsk
 
-OpenXSKernel 是从 OpenXJ380 抽取出来的**纯内核**（kernel-only）仓库。它只构建一个产物
-`out/kernel.krl`，**不包含**引导器、用户态应用、包管理器或第三方 vendored 源码——这些
-分别放在兄弟仓库（OpenXSBoot、LeopardOS、各 `leopard-*` / `*-xbps` 组件仓库）。
+`leopard-xsk` is the kernel component of LeopardOS: an independent,
+Apache-2.0-derived kernel project. It builds one artifact, `out/kernel.krl`,
+and contains **no** bootloader, userspace applications, package manager, or
+vendored third-party source. Those live in sibling repositories
+(`leopard-boot`, LeopardOS, the `leopard-*` / `*-xbps` components).
+
+It is not the OpenXJ380 System Kernel and does not track OpenXJ380 as an
+upstream. See `FORK.md` for provenance and attribution.
 
 构建图由 `tools/gen_ninja.py` 生成，只有两个一等构建目标：`build`（→ `out/kernel.krl`）
 和 `pack`（→ gzip 压缩的 xbps 包）。
@@ -70,7 +75,7 @@ ninja clean                  # 清理 out/、kernel/build_config.h、.pkg/
 ## 已知决策 / 问题（本次会话）
 
 - **zstd 数据损坏 = 上游 lazy-alloc bug，不在内核修。** zstd 的大窗口解压会踩中上游
-  `kernel/memory/` 里的内存损坏 bug（OpenXJ380 与 OpenXSKernel 逐字节一致）。解法定在
+  `kernel/memory/` 里的内存损坏 bug（OpenXJ380 与 leopard-xsk 逐字节一致）。解法定在
   用户态层：xbps 包和 repodata 改用 **gzip** 压缩（各组件 `gen_ninja.py` + LeopardOS
   `build_liveroot.sh` 已完成）。不要在这里"修"内核分配器。
 - **冒号文件名（FAT）：** 正确的原语是 VFAT 驱动层文件名规范化（非法字符处理 + LFN），
@@ -79,7 +84,7 @@ ninja clean                  # 清理 out/、kernel/build_config.h、.pkg/
 
 ## 相关仓库
 
-- 引导器：OpenXSBoot（`out/BOOTX64.efi`）
+- 引导器：leopard-boot（`out/BOOTX64.efi`）
 - live/安装介质与发行版：LeopardOS
 - 用户态组件与包：各 `leopard-*`、`initctl`、`poweroff`、`mkfs-fat32` 等仓库
 

@@ -1,4 +1,4 @@
-# OpenXSKernel 开发与维护规范
+# leopard-xsk 开发与维护规范
 
 ## 建议环境
 
@@ -12,7 +12,7 @@ python3 tools/gen_ninja.py                 # 重新生成构建图
 ninja                                      # 构建内核
 ```
 
-涉及启动、驱动、文件系统或用户可见行为时，还应配合 OpenXSBoot + LeopardOS 在 QEMU 中启动并
+涉及启动、驱动、文件系统或用户可见行为时，还应配合 leopard-boot + LeopardOS 在 QEMU 中启动并
 检查串口日志（见 LeopardOS 的 `TESTING.md`）。
 
 ## 代码与注释
@@ -28,7 +28,7 @@ ninja                                      # 构建内核
 - **上游原版 bug 不改**；先归因，只修自己改动引入的 bug。
 - 修改系统调用时同步检查三处：`sys.cpp` 实现、`syscall.h` 声明、`syscall.cpp` 分发。
 - 修改 VFS/文件句柄时检查 open、dup、close、进程复制和错误回滚路径。
-- 修改启动或内存布局时同时审查 HHDM、链接脚本和页表初始化（与 OpenXSBoot 交接）。
+- 修改启动或内存布局时同时审查 HHDM、链接脚本和页表初始化（与 leopard-boot 交接）。
 - 修改构建图时同步 `tools/gen_ninja.py`；`build.ninja` 是生成文件，不手改。
 
 ## 提交前清单

@@ -25,4 +25,4 @@
 
 - `python3 tools/gen_ninja.py && ninja` 内核构建通过。
 - 宿主机侧单元测试 `python3 -m unittest discover -s tests -v`。
-- 运行时验证配合 OpenXSBoot + LeopardOS 在 QEMU 启动，检查串口日志。
+- 运行时验证配合 leopard-boot + LeopardOS 在 QEMU 启动，检查串口日志。
