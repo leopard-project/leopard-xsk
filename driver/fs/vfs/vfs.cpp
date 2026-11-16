@@ -955,14 +955,8 @@ errno_t vfs_close(vfs_node_t node) {
     if (node->refcount > 0) node->refcount--;
 
     if (node->type & (file_ptmx | file_pts)) {
-        /* fd_dup() bumps both refcount and the PTY handle count
-         * (ptmx_dup/pts_dup).  The fs close callback decrements that count,
-         * so it must run exactly once, when the last reference goes away.
-         * Calling it on every close drives slave_fds/master_fds to zero while
-         * the orchestrator still owns fd 0/1/2, which makes conhost's writes
-         * to the PTY master fail with EIO (keyboard input silently stops). */
-        if (node->refcount > 0) return VFS_STATUS_SUCCESS;
         if (node->handle != NULL) callbackof(node, close)(node->handle);
+        if (node->refcount > 0) return VFS_STATUS_SUCCESS;
         node->handle = NULL;
         if (node->parent == NULL) {
             free(node->name);
